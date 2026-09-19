@@ -1,0 +1,103 @@
+===============================================================
+ MINIMAL NON-DESTRUCTIVE ENVIRONMENT AUDIT
+ generated: Sat Sep 12 16:35:50 UTC 2026
+===============================================================
+
+=== 1. GUEST DETECTION ===
+--- checks whether this shell is inside a virtualized guest ---
+systemd-detect-virt : kvm
+hypervisor CPU flag : present  (=> running inside a VM)
+firmware vendor     : QEMU
+firmware product    : Ubuntu 24.04 PC v2 (i440FX + PIIX, arch_caps fix, 1996)
+hostname            : ubuntu
+
+=== 2. OS AND ARCHITECTURE ===
+--- confirms distribution, kernel and CPU; none of this is assumed ---
+PRETTY_NAME="Ubuntu 22.04.5 LTS"
+NAME="Ubuntu"
+VERSION_ID="22.04"
+VERSION="22.04.5 LTS (Jammy Jellyfish)"
+kernel / arch : Linux 5.15.0-1103-kvm x86_64
+Architecture:                            x86_64
+CPU(s):                                  1
+Model name:                              Intel(R) Xeon(R) CPU E5-2630 v3 @ 2.40GHz
+Thread(s) per core:                      1
+Core(s) per socket:                      1
+Socket(s):                               1
+L1d cache:                               32 KiB (1 instance)
+L1i cache:                               32 KiB (1 instance)
+L2 cache:                                4 MiB (1 instance)
+L3 cache:                                16 MiB (1 instance)
+
+=== 3. PYTHON INTERPRETERS ===
+--- the documented profiling command depends on a debug build ---
+python3 : Python 3.10.12 (main, Jun 22 2026, 18:55:27) [GCC 11.4.0] 
+    path : /usr/bin/python3
+python3-dbg : NOT FOUND
+
+=== 4. BENCHMARK HARNESS ===
+--- version determines which command-line options exist ---
+python3 -m pyperformance --version : /usr/bin/python3: No module named pyperformance
+
+--- available benchmark names (authoritative for THIS install) ---
+--- if this appears to hang or wants to build anything, press Ctrl-C
+    and report that it did so; nothing is expected to be created ---
+/usr/bin/python3: No module named pyperformance
+
+=== 5. CANDIDATE BENCHMARK SOURCE LOCATIONS ===
+--- every constant used in planning must be read from these files ---
+Could not locate the benchmark data directory.
+python3 -c 'import pyperformance' result:
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+ModuleNotFoundError: No module named 'pyperformance'
+
+=== 6. PROFILER ===
+--- version, permission level, and whether counters actually work ---
+perf version : perf version 5.15.200
+perf_event_paranoid    : 4
+perf_event_max_sample_rate : 100000
+
+--- counter smoke test: runs /bin/true only, changes nothing ---
+--- '<not supported>' here is the single most important finding ---
+
+ Performance counter stats for '/bin/true':
+
+              0.61 msec task-clock                #    0.093 CPUs utilized          
+            820264      cycles                    #    1.352 GHz                    
+            468498      instructions              #    0.57  insn per cycle         
+             16804      cache-references          #   27.703 M/sec                  
+               497      cache-misses              #    2.958 % of all cache refs    
+
+       0.006518347 seconds time elapsed
+
+       0.000000000 seconds user
+       0.006478000 seconds sys
+
+
+
+=== 7. FLAME GRAPH TOOLING ===
+--- targeted checks only; no filesystem scan is performed ---
+flamegraph.pl : not on PATH
+stackcollapse-perf.pl : not on PATH
+=> no flame-graph scripts found in the checked locations
+--- perf built-in script engines ---
+open(/usr/libexec/perf-core/scripts) failed.
+Check "PERF_EXEC_PATH" env to set scripts dir.
+
+=== 8. HDL SIMULATOR ===
+--- determines whether simulating the accelerator is already possible ---
+iverilog : not installed
+vvp : not installed
+verilator : not installed
+gtkwave : not installed
+yosys : not installed
+ghdl : not installed
+vsim : not installed
+xvlog : not installed
+=> no HDL simulator found on PATH
+
+===============================================================
+ AUDIT COMPLETE
+ Nothing was installed, upgraded, modified, or deleted.
+===============================================================
