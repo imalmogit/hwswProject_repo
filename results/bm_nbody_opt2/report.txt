@@ -1,0 +1,257 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 9K of event 'cpu-clock'
+# Event count (approx.): 45256275750
+#
+# Overhead  Command  Shared Object      Symbol                                    
+# ........  .......  .................  ..........................................
+#
+    51.80%  python   python3.10d        [.] _PyEval_EvalFrameDefault
+            |
+            ---_PyEval_EvalFrameDefault
+               |          
+               |--1.52%--0x87c00180014157c
+               |          
+               |--1.21%--0xd7c00170014147c
+               |          
+               |--1.15%--0x1b7d1a7d197d035c
+               |          
+               |--0.97%--0xa7d035c035c097d
+               |          
+               |--0.89%--0x871003c03640d7c
+               |          
+               |--0.80%--0x35c097d087d077d
+               |          
+               |--0.78%--0x180014157c0f7c
+               |          
+               |--0.76%--0x170014147c117c
+               |          
+               |--0.74%--0x180a7c057c0e7d
+               |          
+               |--0.70%--0x35c035c097d087d
+               |          
+               |--0.67%--0x137d001b00140183
+               |          
+               |--0.66%--0x127d00170014117c
+               |          
+               |--0.66%--0x170014147c107c
+               |          
+               |--0.64%--0x127c0174127c007c
+               |          
+               |--0.63%--0x177d167d035c087c
+               |          
+               |--0.63%--0xa7c057c0e7d0d7d
+               |          
+               |--0.60%--0x180014157c117c
+               |          
+               |--0.60%--0x14137c097c137d
+               |          
+               |--0.58%--0x180014157c107c
+               |          
+               |--0.56%--0x183127c0174127c
+               |          
+               |--0.52%--0x1b7c003c02640d7c
+               |          
+               |--0.52%--0xd7c187d177d167d
+               |          
+               |--0.52%--0x170014117c117c
+               |          
+               |--0.51%--0x1d7d035c1c7d035c
+               |          
+                --0.51%--0x197c003c0364087c
+
+     7.05%  python   python3.10d        [.] binary_op1
+            |
+            ---binary_op1
+               |          
+                --6.36%--0x9ad3c0
+
+     4.09%  python   python3.10d        [.] float_mul.lto_priv.0
+            |
+            ---float_mul.lto_priv.0
+               0x9ad3c0
+
+     4.08%  python   python3.10d        [.] PyFloat_FromDouble
+            |
+            ---PyFloat_FromDouble
+               |          
+                --0.52%--0x9ad3c0
+
+     3.74%  python   python3.10d        [.] float_dealloc.lto_priv.0
+            |
+            ---float_dealloc.lto_priv.0
+
+     2.68%  python   python3.10d        [.] list_ass_item.lto_priv.0
+            |
+            ---list_ass_item.lto_priv.0
+               0x9ad3c0
+
+     2.19%  python   python3.10d        [.] float_sub.lto_priv.0
+            |
+            ---float_sub.lto_priv.0
+               0x9ad3c0
+
+     1.93%  python   python3.10d        [.] _Py_CheckSlotResult
+            |
+            ---_Py_CheckSlotResult
+               |          
+                --1.55%--0x9ad3c0
+
+     1.72%  python   python3.10d        [.] float_add.lto_priv.0
+            |
+            ---float_add.lto_priv.0
+               0x9ad3c0
+
+     1.57%  python   python3.10d        [.] _Py_NewReference
+            |
+            ---_Py_NewReference
+
+     1.53%  python   python3.10d        [.] get_float_state
+            |
+            ---get_float_state
+
+     1.40%  python   python3.10d        [.] _Py_Dealloc
+            |
+            ---_Py_Dealloc
+
+     1.34%  python   python3.10d        [.] PyNumber_AsSsize_t
+            |
+            ---PyNumber_AsSsize_t
+               |          
+                --0.97%--0x9ad3c0
+
+     1.25%  python   python3.10d        [.] PyObject_SetItem
+            |
+            ---PyObject_SetItem
+               |          
+                --0.60%--0x9ad3c0
+
+     1.21%  python   python3.10d        [.] PyNumber_Multiply
+            |
+            ---PyNumber_Multiply
+
+     1.17%  python   python3.10d        [.] list_ass_subscript.lto_priv.0
+            |
+            ---list_ass_subscript.lto_priv.0
+               0x9ad3c0
+
+     0.97%  python   python3.10d        [.] _PyNumber_Index
+            |
+            ---_PyNumber_Index
+               |          
+                --0.82%--0x9ad3c0
+
+     0.83%  python   python3.10d        [.] binary_op
+            |
+            ---binary_op
+
+     0.81%  python   python3.10d        [.] PyLong_AsSsize_t
+            |
+            ---PyLong_AsSsize_t
+               0x9ad3c0
+
+     0.78%  python   python3.10d        [.] call_function.lto_priv.0
+            |
+            ---call_function.lto_priv.0
+
+     0.74%  python   python3.10d        [.] float_div.lto_priv.0
+            |
+            ---float_div.lto_priv.0
+               0x9ad3c0
+
+     0.70%  python   python3.10d        [.] listiter_next.lto_priv.0
+            |
+            ---listiter_next.lto_priv.0
+
+     0.53%  python   python3.10d        [.] PyTuple_GetItem
+            |
+            ---PyTuple_GetItem
+
+     0.53%  python   python3.10d        [.] math_1_to_whatever
+            |
+            ---math_1_to_whatever
+
+     0.44%  python   python3.10d        [.] lookdict_unicode_nodummy
+     0.42%  python   python3.10d        [.] PyNumber_Add
+     0.34%  python   python3.10d        [.] cfunction_vectorcall_O.lto_priv.0
+     0.31%  python   libc.so.6          [.] pthread_getspecific@@GLIBC_2.34
+     0.30%  python   python3.10d        [.] PyNumber_Subtract
+     0.29%  python   python3.10d        [.] _PyMem_DebugCheckAddress
+     0.24%  python   python3.10d        [.] _PyDict_LoadGlobal
+     0.21%  python   python3.10d        [.] _PyObject_VectorcallTstate.lto_priv.10
+     0.20%  python   python3.10d        [.] read_size_t
+     0.18%  python   python3.10d        [.] PyGILState_Check
+     0.18%  python   python3.10d        [.] _PyObject_Malloc
+     0.16%  python   libc.so.6          [.] __memset_avx2_unaligned_erms
+     0.14%  python   python3.10d        [.] _Py_CheckFunctionResult
+     0.13%  python   python3.10d        [.] list_iter.lto_priv.0
+     0.11%  python   python3.10d        [.] PyFloat_AsDouble
+     0.11%  python   python3.10d        [.] arena_map_get
+     0.10%  python   python3.10d        [.] PyThread_tss_get
+     0.10%  python   python3.10d        [.] _PyMem_DebugRawAlloc
+     0.09%  python   python3.10d        [.] write_size_t
+     0.08%  python   libm.so.6          [.] __sqrt_finite@GLIBC_2.15
+     0.08%  python   python3.10d        [.] listiter_dealloc.lto_priv.0
+     0.07%  python   python3.10d        [.] _PyObject_GC_Alloc
+     0.07%  python   python3.10d        [.] math_sqrt
+     0.06%  python   python3.10d        [.] rangeiter_next.lto_priv.0
+     0.04%  python   python3.10d        [.] PyLong_FromLong
+     0.04%  python   python3.10d        [.] _PyGILState_GetThisThreadState
+     0.04%  python   python3.10d        [.] math_1
+     0.03%  python   libc.so.6          [.] __errno_location
+     0.03%  python   python3.10d        [.] PyObject_Free
+     0.03%  python   python3.10d        [.] PyObject_Malloc
+     0.03%  python   python3.10d        [.] PyThreadState_Get
+     0.03%  python   python3.10d        [.] _PyObject_Free
+     0.03%  python   python3.10d        [.] _PyObject_GC_New
+     0.03%  python   python3.10d        [.] arena_map_is_used
+     0.03%  python   python3.10d        [.] validate_list
+     0.03%  python   python3.10d        [.] 0x0000000000022c54
+     0.02%  python   python3.10d        [.] PyNumber_TrueDivide
+     0.02%  python   python3.10d        [.] PyThread_tss_is_created
+     0.02%  python   python3.10d        [.] PyType_IsSubtype
+     0.02%  python   python3.10d        [.] _PyMem_DebugRawMalloc
+     0.02%  python   python3.10d        [.] _PyObject_GC_Malloc
+     0.02%  python   python3.10d        [.] address_in_range
+     0.02%  python   python3.10d        [.] object_dealloc.lto_priv.0
+     0.01%  file     libmagic.so.1.0.0  [.] 0x000000000000b99c
+     0.01%  python   libc.so.6          [.] __strncpy_avx2
+     0.01%  python   libm.so.6          [.] __sqrt
+     0.01%  python   python3.10d        [.] PyCallable_Check
+     0.01%  python   python3.10d        [.] PyException_SetTraceback
+     0.01%  python   python3.10d        [.] PyMem_Calloc
+     0.01%  python   python3.10d        [.] PyObject_GC_Del
+     0.01%  python   python3.10d        [.] PyObject_GetAttr
+     0.01%  python   python3.10d        [.] PyUnicode_New
+     0.01%  python   python3.10d        [.] _PyDict_CheckConsistency
+     0.01%  python   python3.10d        [.] _PyEval_Vector
+     0.01%  python   python3.10d        [.] _PyLong_New
+     0.01%  python   python3.10d        [.] _PyMem_DebugFree
+     0.01%  python   python3.10d        [.] _PyMem_DebugRawFree
+     0.01%  python   python3.10d        [.] _PyMem_DebugRawRealloc
+     0.01%  python   python3.10d        [.] _PyObjectDict_SetItem
+     0.01%  python   python3.10d        [.] _PyObject_GC_NewVar
+     0.01%  python   python3.10d        [.] _PyObject_IsFreed
+     0.01%  python   python3.10d        [.] _PyUnicode_CheckConsistency
+     0.01%  python   python3.10d        [.] insert_to_freepool
+     0.01%  python   python3.10d        [.] list_resize
+     0.01%  python   python3.10d        [.] siphash24
+     0.01%  python   python3.10d        [.] tok_nextc
+     0.01%  python   python3.10d        [.] untrack_dicts
+     0.01%  python   python3.10d        [.] visit_decref
+     0.01%  python   python3.10d        [.] 0x0000000000021100
+     0.01%  python   python3.10d        [.] 0x00000000000223d4
+     0.01%  python   python3.10d        [.] 0x0000000000022670
+     0.01%  python   [unknown]          [k] 0xffffffffbdac428a
+     0.01%  python   [unknown]          [k] 0xffffffffbdb6db46
+     0.01%  python   [unknown]          [k] 0xffffffffbdcac729
+     0.01%  python   [unknown]          [k] 0xffffffffbdd0f5da
+     0.01%  python   [unknown]          [k] 0xffffffffbdf86f27
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#
