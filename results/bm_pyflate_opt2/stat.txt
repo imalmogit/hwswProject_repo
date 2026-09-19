@@ -1,0 +1,39 @@
+=== task-clock,context-switches,page-faults,cycles,instructions ===
+pyflate_opt2: Mean +- std dev: 2.63 sec +- 0.00 sec
+pyflate_opt2: Mean +- std dev: 2.71 sec +- 0.00 sec
+pyflate_opt2: Mean +- std dev: 2.61 sec +- 0.01 sec
+
+ Performance counter stats for '/root/sw-project/baseline/scripts/venv/cpython3.10-58f517067257-compat-31b33d68c68a/bin/python -u ./benchmarks/bm_pyflate_opt2/run_benchmark.py --worker -l 1 -w 1 -n 20' (3 runs):
+
+          55155.26 msec task-clock                #    0.986 CPUs utilized            ( +-  1.14% )
+               409      context-switches          #    7.315 /sec                     ( +-  2.06% )
+            128058      page-faults               #    2.290 K/sec                    ( +-  0.08% )
+      131297320057      cycles                    #    2.348 GHz                      ( +-  1.15% )
+      292812563603      instructions              #    2.20  insn per cycle           ( +-  0.22% )
+
+            55.959 +- 0.631 seconds time elapsed  ( +-  1.13% )
+
+=== cache-references,cache-misses ===
+pyflate_opt2: Mean +- std dev: 2.63 sec +- 0.02 sec
+pyflate_opt2: Mean +- std dev: 2.62 sec +- 0.00 sec
+pyflate_opt2: Mean +- std dev: 2.60 sec +- 0.00 sec
+
+ Performance counter stats for '/root/sw-project/baseline/scripts/venv/cpython3.10-58f517067257-compat-31b33d68c68a/bin/python -u ./benchmarks/bm_pyflate_opt2/run_benchmark.py --worker -l 1 -w 1 -n 20' (3 runs):
+
+          90893575      cache-references                                              ( +-  2.69% )
+          13900122      cache-misses              #   14.795 % of all cache refs      ( +-  4.62% )
+
+            55.230 +- 0.192 seconds time elapsed  ( +-  0.35% )
+
+=== branches,branch-misses ===
+pyflate_opt2: Mean +- std dev: 2.60 sec +- 0.00 sec
+pyflate_opt2: Mean +- std dev: 2.62 sec +- 0.01 sec
+pyflate_opt2: Mean +- std dev: 2.65 sec +- 0.00 sec
+
+ Performance counter stats for '/root/sw-project/baseline/scripts/venv/cpython3.10-58f517067257-compat-31b33d68c68a/bin/python -u ./benchmarks/bm_pyflate_opt2/run_benchmark.py --worker -l 1 -w 1 -n 20' (3 runs):
+
+       73121575193      branches                                                      ( +-  0.82% )
+         344030765      branch-misses             #    0.48% of all branches          ( +-  0.77% )
+
+            55.411 +- 0.276 seconds time elapsed  ( +-  0.50% )
+
