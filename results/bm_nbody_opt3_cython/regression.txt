@@ -1,0 +1,23 @@
+bm_nbody_opt3_cython -- startup separated from per-call cost
+
+Measured (perf stat -r 3, fixed work):
+   calls      instructions   task-clock (ms)
+      21     1,157,153,533            308.56
+      61     1,947,033,411            464.37
+     101     2,735,572,499            617.02
+
+instructions: fit on calls=21 and calls=61, calls=101 held out
+  startup  : 742.467 M
+  per call : 19.747 M
+  predicted at calls=101: 2,736.913 M   measured 2,735.572 M   error +0.05%
+  naive total/calls at N=100: 27.085 M  (+37.2% vs the slope)
+
+time: fit on calls=21 and calls=61, calls=101 held out
+  startup  : 226.760 ms
+  per call : 3.895 ms
+  predicted at calls=101: 620.180 ms   measured 617.020 ms   error +0.51%
+  naive total/calls at N=100: 6.109 ms  (+56.8% vs the slope)
+
+Cross-check: the time slope above and the pyperf mean in timing.txt
+come from different runs through different machinery. If they agree to
+a few percent, the fit is measuring the benchmark and not the harness.
