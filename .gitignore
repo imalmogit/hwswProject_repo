@@ -30,3 +30,7 @@ venv*/
 COMMITS.txt
 RUN_FROM_SCRATCH.txt
 scripts/collect_results.sh
+scripts/run_project.sh
+scripts/preflight.sh
+scripts/figures.sh
+.project_progress
