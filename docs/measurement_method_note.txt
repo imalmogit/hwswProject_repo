@@ -1,0 +1,331 @@
+================================================================================
+        WHY OUR PROFILING COMMAND DIFFERS FROM THE PROJECT GUIDE
+                    background note -- read before the presentation
+================================================================================
+
+This is a study note, not a deliverable. It explains one decision we made that
+departs from the project guide, why we made it, what evidence supports it, and
+how to answer questions about it.
+
+
+--------------------------------------------------------------------------------
+1. WHAT THE GUIDE SAYS
+--------------------------------------------------------------------------------
+
+The project PDF, in "Guide: Setting Up pyperformance in a Virtual Environment",
+Step 2, gives this command:
+
+    perf record -F 999 -g -- python3-dbg -m pyperformance run --bench json_dumps
+    perf report --stdio > perf_report.txt
+
+That is the documented way to profile a benchmark for this course. We started
+there. Our first baseline used exactly that shape.
+
+
+--------------------------------------------------------------------------------
+2. WHAT WE USE INSTEAD
+--------------------------------------------------------------------------------
+
+For COUNTERS and PROFILES:
+
+    perf stat  -r 3 -e <events> -- \
+        python -u <bench>/run_benchmark.py --worker -l 1 -w 1 -n <N>
+
+    perf record -e cpu-clock -F 199 -g -- \
+        python -u <bench>/run_benchmark.py --worker -l 1 -w 1 -n <N>
+
+    N = 100 for nbody, N = 20 for pyflate
+
+For TIMING we still use the normal harness (a full pyperformance-style run
+through pyperf's manager), because that is what produces a statistically sound
+mean.
+
+Two differences from the guide:
+    (a) perf is pointed at a single pyperf WORKER process rather than at the
+        whole `pyperformance run` command.
+    (b) the sampling event is named explicitly: -e cpu-clock.
+
+
+--------------------------------------------------------------------------------
+3. WHY (a): THE GUIDE'S COMMAND MEASURES MORE THAN THE BENCHMARK
+--------------------------------------------------------------------------------
+
+`pyperformance run --bench X` is not one program. It starts roughly 27 Python
+processes:
+
+    1   pyperformance itself
+    4   pip invocations (it checks/installs requirements into its venv)
+    1   pyperf manager
+    21  worker processes  (1 calibration + 20 measurement workers)
+
+`perf record -- <that command>` follows children, so it profiles ALL of them.
+
+HOW WE MEASURED THE CONTAMINATION
+
+pyperf writes a JSON file containing every individual timed warmup and value,
+for every worker. Summing those gives the exact number of seconds spent inside
+the benchmark function. Comparing that to perf's wall time gives the share:
+
+                                            nbody        pyflate
+    perf stat elapsed per run               51.7 s       277.8 s
+    benchmark code, all 21 processes        40.2 s       263.6 s
+    share that is actually the benchmark    77.9%         94.9%
+
+    per-call instructions, guide's method   3.372 G      17.053 G
+    per-call instructions, measured directly 2.909 G     16.784 G
+    OVER-COUNT                              +15.9%        +1.6%
+
+So for nbody, 22% of every counter in that profile belongs to pip, process
+startup, and the harness -- not to nbody.
+
+DIRECT EVIDENCE IN THE PROFILE
+
+The contaminated nbody profile contains samples from these commands:
+
+    lsb_release
+    dpkg-query
+    uname
+
+Those are programs the harness runs while checking the environment. They are
+not nbody. This is visible in the "Command" column of the perf report from our
+first baseline, kept in results/_first_baseline/ precisely so this claim can
+be checked.
+
+WHY IT MATTERS FOR THIS PROJECT SPECIFICALLY
+
+Three concrete problems, all of which would have damaged our results:
+
+  1. CROSS-BENCHMARK COMPARISON BREAKS.
+     nbody's profile was 22% contaminated, pyflate's only 5%. Any statement
+     comparing their counters would have been comparing two different mixtures.
+
+  2. OPTIMIZATIONS GET UNDER-REPORTED.
+     The harness cost is FIXED. It does not shrink when the benchmark gets
+     faster. So a real 10% improvement in nbody would show up as roughly 8% in
+     the guide's method. Our best result (opt3, 99.2%) would have been badly
+     distorted.
+
+  3. THE AMOUNT OF WORK CAN CHANGE SILENTLY.
+     pyperf re-calibrates its loop count whenever one call drops below 100 ms.
+     After a large optimization it runs MORE loops. The counters then describe
+     a different amount of work than the baseline did, and the comparison is
+     meaningless without anyone being warned.
+
+Problem 3 actually bit us. After the Cython optimization nbody went from 477 ms
+to 3.81 ms per call -- far under the 100 ms threshold -- so pyperf's own
+calibration would have changed the loop count. Pinning -l 1 -w 1 -n N prevents
+that.
+
+THE FIX
+
+    --worker      run one pyperf worker directly: no pyperformance, no pip,
+                  no manager, no other processes.
+    -l 1          loops per measurement. 1 is the value pyperf's own
+                  calibration chose for both benchmarks (recorded in the JSON
+                  metadata as "loops": 1), so we are not inventing a number.
+    -w 1          one warmup call.
+    -n N          N timed calls.
+
+The process therefore performs exactly N+1 benchmark calls and nothing else.
+That is a FIXED UNIT OF WORK, which is what makes instruction counts comparable
+between the baseline and an optimized variant.
+
+HOW WE VALIDATED IT
+
+The -n 20 vs -n 100 comparison below is from the FIRST measurement round. The
+final numbers in the reports come from a second, independent round; the two
+agreed on per-call instructions to four significant figures (2.909 G both
+times) and on the eval-loop share to 0.8 percentage points, which is a
+stronger repeatability check than either round could give on its own.
+
+    task-clock explained by (calls x pyperf mean)      99.4% nbody
+                                                      98.4% pyflate
+    per-call instructions at -n 20 vs -n 100          2.937 G vs 2.909 G
+                                                      (0.97% apart)
+    eval-loop share at -n 20 vs -n 100                45.14% vs 44.75%
+                                                      (0.39 points apart)
+    lost samples                                      0
+
+The first line is the important one: 99.4% of the process's CPU time is
+accounted for by the benchmark calls themselves. In the guide's method that
+figure was 77.9%.
+
+There is also a prediction that came true. In the contaminated baseline,
+_PyEval_EvalFrameDefault was 37.09% of nbody. If 77.9% of the run is benchmark
+code, the clean figure should be AT MOST 37.09 / 0.779 = 47.6%. We measured
+44.75% -- just under the ceiling, which is exactly right, because the harness
+processes run some interpreter loop of their own. That is an independent check
+that the contamination estimate was correct.
+
+
+--------------------------------------------------------------------------------
+4. WHY (b): WITHOUT -e cpu-clock, perf CAPTURES NOTHING
+--------------------------------------------------------------------------------
+
+This one is not a judgement call. It is a hard failure on the course guest.
+
+Running `perf record -F 999 -g -- ...` without -e produced:
+
+    Error:
+    The nbody.perf.data data has no samples!
+
+ZERO samples, and no error message during the recording itself.
+
+THE CAUSE
+
+    perf_event_paranoid : 4
+    dmesg               : "Performance Events: Haswell events, full-width
+                           counters, Intel PMU driver"
+
+The guest DOES expose an Intel PMU. That is why `perf stat` returns real cycle
+and instruction counts. But the virtualized PMU does not deliver sampling
+INTERRUPTS. So:
+
+    perf record without -e  ->  opens the hardware "cycles" event successfully
+                            ->  never falls back to a software event
+                            ->  arms it, and no interrupt ever fires
+                            ->  0 samples, silently
+
+Our original baseline happened to land on the software event cpu-clock
+(perf's fallback triggered on that occasion), which is why the first profile
+worked and a later one did not.
+
+THE FIX
+
+    perf record -e cpu-clock -F 199 -g ...
+
+cpu-clock is a software event driven by a high-resolution timer, independent of
+the PMU. -F 199 rather than 999 because this guest's timer only delivers around
+200 samples/second reliably; asking for 999 just gets throttled.
+
+IMPORTANT: this is the SAME event our original baseline recorded, so old and
+new profiles remain directly comparable. Naming it explicitly makes the
+behaviour deterministic instead of depending on whether perf's fallback
+triggers.
+
+A RELATED ISSUE: FLAME GRAPHS NEED --call-graph dwarf
+
+With plain -g, perf uses frame-pointer unwinding. The interpreter is built with
+-Og, which omits frame pointers, so the unwinder walks stack garbage. The
+children printed under _PyEval_EvalFrameDefault included values like
+
+    0xdddddddddddddddd
+    0xfdfdfdfdfdfdfd00
+
+which are the CPython debug allocator's own memory fill patterns being read as
+return addresses. The FLAT percentages are unaffected (they come from the
+sampled instruction pointer, not the stack walk), so all our bottleneck numbers
+stand. But flame graphs need real call chains, hence --call-graph dwarf in the
+flamegraph stage of our scripts.
+
+
+--------------------------------------------------------------------------------
+5. WHAT WE DID **NOT** CHANGE
+--------------------------------------------------------------------------------
+
+It is worth being clear about the limits of the deviation, because this is the
+first thing a grader will want to know.
+
+  * We did not change the benchmarks' workload. nbody still runs 20,000
+    timesteps; pyflate still decompresses the same file and still verifies the
+    same MD5.
+  * We did not change how TIMING is produced. Every "X ms per call" figure in
+    our reports comes from the standard pyperf manager run: 20 independent
+    worker processes with randomized memory layout, mean and standard
+    deviation. That is the harness the guide intends.
+  * We did not skip the required outputs. Flame graphs, perf reports and
+    statistics reports are all generated, as the guide's example produces.
+  * We kept the original measurement. results/_first_baseline/ holds the
+    contaminated profile and stats, so the comparison in section 3 above can
+    be verified by anyone reading the repository.
+
+The deviation is narrow: it affects only WHICH PROCESS perf is attached to for
+counters and profiles, and which event is named.
+
+
+--------------------------------------------------------------------------------
+6. HOW TO ANSWER QUESTIONS ABOUT THIS
+--------------------------------------------------------------------------------
+
+Q: "Why didn't you use the command in the guide?"
+
+    We did, first. Then we checked what it was measuring and found that about
+    22% of nbody's counters came from pip and the harness rather than from
+    nbody. The guide's command is right for SEEING where time goes inside
+    Python -- which is what that section of the guide is about. It is not
+    precise enough for COMPARING instruction counts between an optimized
+    version and a baseline, which is what we needed for the hardware
+    justification.
+
+Q: "How do you know it was 22%?"
+
+    pyperf's JSON output records every individual timed value for every worker
+    process. Summing them gives the exact seconds spent inside the benchmark
+    function: 40.2 s out of 51.7 s of wall time. We also saw lsb_release,
+    dpkg-query and uname in the profile, which are harness processes.
+
+Q: "Isn't a single worker less statistically sound than 20 processes?"
+
+    Yes, and that is why we do not use it for timing. Timing comes from the
+    20-process run. The single worker is used only for counters and profiles,
+    where the goal is a fixed, repeatable unit of work rather than a
+    distribution. We report both, and we never mix them.
+
+Q: "How do you know the single-worker measurement is reliable?"
+
+    Three checks. 99.4% of its CPU time is accounted for by the benchmark
+    calls. Per-call instruction counts at -n 20 and -n 100 agree to within
+    0.97%, which means the measurement scales linearly as it should. And the
+    eval-loop share landed just under the ceiling predicted from the
+    contamination estimate, which is an independent confirmation.
+
+Q: "Did this change your results?"
+
+    It made them trustworthy rather than changing their direction. The clearest
+    case: after the Cython optimization, nbody runs 3.81 ms per call. In the
+    guide's method pyperf would have silently re-calibrated to a different loop
+    count and the instruction comparison would have been meaningless. With
+    locked flags, we measured a 147x instruction reduction that we can defend.
+
+Q: "Why -F 199 instead of -F 999?"
+
+    The guest's timer does not sustain 999 Hz; our original baseline requested
+    999 and got an effective ~200 Hz. Asking for a rate the system can actually
+    deliver makes the sample count predictable.
+
+
+--------------------------------------------------------------------------------
+7. THE HONEST RISK
+--------------------------------------------------------------------------------
+
+A grader could reasonably say: "the guide's command was good enough, you
+over-engineered this."
+
+That is a fair position and worth acknowledging rather than arguing against.
+The response is that the over-engineering bought one specific thing we could
+not have got otherwise -- per-call instruction counts that are comparable
+between versions -- and that we needed those to make quantitative claims about
+hardware acceleration rather than just "it got faster".
+
+It is also worth saying plainly: the deviation cost us time. We measured the
+baseline twice. The second measurement is the one in the reports.
+
+Do NOT present this as "the guide is wrong". The guide's command is appropriate
+for its stated purpose, which is showing Python-level function calls and stack
+traces in the profile. We needed something narrower for a different purpose.
+
+
+--------------------------------------------------------------------------------
+8. WHERE THIS IS DOCUMENTED IN THE SUBMISSION
+--------------------------------------------------------------------------------
+
+    report_nbody.txt        section 2.1  the correction
+                            section 2.2  the method used instead
+                            section 2.3  the zero-samples trap
+                            section 2.4  validation
+    report_pyflate.txt      section 2.1  the same, with pyflate's figures
+    README.md               "Method notes"
+    results/_first_baseline/  the original contaminated measurement, kept
+                              deliberately as evidence
+
+================================================================================

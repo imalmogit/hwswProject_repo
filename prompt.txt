@@ -1,0 +1,169 @@
+================================================================================
+                    AI TOOL USE IN THIS PROJECT
+        HW/SW Co-design, Technion 00460882 -- Almog As, Tal Schnieder
+================================================================================
+
+Tool: Claude (Anthropic), ChatGPT (OpenAI) used through the chat interface across two working
+sessions.
+
+This file records what we asked it, what it produced, and where we
+had to correct it.
+
+--------------------------------------------------------------------------------
+1. HOW WE WORKED
+--------------------------------------------------------------------------------
+
+The pattern was the same throughout: we ran everything ourselves on the QEMU
+guest, pasted the raw output back, and asked for an interpretation. Nothing in
+this repository is a number the tool invented -- every figure in the reports
+traces to a file in results/, and we asked it to prove that twice.
+
+The tool was useful for three things:
+1.spotting that a measurement was measuring the wrong thing
+2. writing code we could then check
+3.writing prose about results we had already verified
+It was unreliable at arithmetic it had not been made to recompute, which is the
+failure mode that cost us the most time.
+
+--------------------------------------------------------------------------------
+2. THE MAIN PROMPTS, ROUGHLY IN ORDER
+--------------------------------------------------------------------------------
+
+2.1  Diagnosing the first baseline
+
+    "I think we have some problem and mis-match. I did nbody
+     baseline and pyflate baseline but I'm not sure what we did is good. I want
+     you to find out what can be the problem, I will send you the results."
+
+We had followed the project guide's perf command and something felt wrong. We
+uploaded the results archives. The tool found that `pyperformance run` starts
+about 27 processes and that perf was counting all of them -- pip, the manager,
+21 workers -- and showed the contamination directly: the profile contained
+samples from lsb_release, dpkg-query and uname. It then computed the share of
+benchmark code from pyperf's own JSON: 77.9% for nbody, 94.9% for pyflate.
+
+That analysis is what led to the --worker -l 1 -w 1 -n N method used
+throughout, and to docs/measurement_method_note.txt.
+
+2.2  Deciding to start over
+
+    "based on the results I send you, do you think it's better start everything
+     and do it from the beginning, so it will be perfect? I have the time for
+     that. I want it to be in high level and I'm concerned I'm doing kind of
+     small repair that aren't good enough."
+
+The decision to re-measure from scratch rather than patch the existing numbers
+was ours. We asked for an opinion and took it, but the cost -- about two hours
+of measurement -- was ours to spend.
+
+2.3  The zero-samples trap
+
+    "looks like there are no sampling at all"
+
+We noticed that `perf report` said "data has no samples" after a recording that
+had printed no error. The tool's first explanation was wrong: it predicted the
+kernel had throttled the sample rate. We checked and it had not --
+perf_event_max_sample_rate was 100000 and dmesg showed no throttling. Only
+after we pasted that output did it reach the correct diagnosis: the guest's
+virtualised PMU counts events but does not deliver sampling interrupts, so perf
+opens the hardware `cycles` event successfully and then records nothing.
+
+The fix (-e cpu-clock -F 199) is in every profiling command in this repository.
+We would not have got there without pushing back on the first answer.
+
+2.4  Optimizations
+
+    "please give me the code and the steps I need to do for the optimizations"
+
+The five variants in benchmarks/ were written by the tool from the profile.
+Each was verified before any timing was taken -- nbody against the original's
+final energy, pyflate against the benchmark's own MD5 -- and those verification
+scripts were part of what we asked for, because we did not want to measure a
+variant that computed the wrong answer quickly.
+
+nbody opt2 turned out to be a regression. We kept it deliberately; it is the
+most instructive result in the project.
+
+2.5  Hardware
+
+    "the hardware section needs to be done - we only need suggestion for 1
+     benchmark!"
+
+We narrowed the scope to one benchmark. The tool produced the Verilog, the
+testbench and gen_stimulus.py, which instruments move_to_front during a real
+decode so the testbench replays traffic the benchmark actually generated rather
+than synthetic vectors. The first simulation failed with 20,000 mismatches --
+a scoreboard off-by-one in the testbench, which it found and fixed.
+
+2.6  The repository
+
+    "I now want to make a new repository with everything because my repo is
+     messy and the commits are not clear."
+
+We asked for a commit structure that reads as development rather than a single
+import. The 16-commit sequence, the scripts in scripts/, and the walkthrough we
+followed came out of that. We ran every command and wrote every commit
+ourselves.
+
+2.7  Updating the reports
+
+    "even if it's less than 3% I think it's better to make the changes in the
+     report to match those measurements"
+
+After re-running, our numbers differed slightly from the first round. The tool
+offered to keep the old figures with a note. We chose to update all of them --
+roughly sixty numbers across the two reports -- because a report whose tables
+disagree with its own committed evidence is worse than one with older numbers.
+
+--------------------------------------------------------------------------------
+3. HOW THE REPORT FIGURES WERE CHECKED
+--------------------------------------------------------------------------------
+
+After the reports were rewritten to the second run's numbers, we had every
+quantitative claim in report_nbody.txt, report_pyflate.txt, README.md and
+hardware/README.md re-derived from the raw files in results/ by a separate
+process that had not seen the editing -- parsing timing.txt, stat.txt and
+report.txt and recomputing each percentage, each per-call figure and each
+attribution table.
+
+The first pass found ten discrepancies. Fixing those introduced five more,
+which a second pass found. Both rounds are reflected in the current text. The
+substantive ones were: a stale 0.372 G figure, an out-of-date profile share
+(10.74% where the measurement said 9.57%), two different numbers for the same
+quantity in one sentence, and a claim that process startup was a larger share
+of a fixed-work run than the benchmark itself, which is simply false -- it is
+37%.
+
+Anyone can repeat this check. Every figure in the reports comes from a file
+committed in results/.
+
+
+--------------------------------------------------------------------------------
+4. README REVIEW AGAINST THE PROJECT INSTRUCTIONS
+--------------------------------------------------------------------------------
+
+This final documentation review used ChatGPT (OpenAI), in addition to the
+Claude sessions described above.
+
+    "I'm adding a README file and the project instructions. Please make sure
+     everything in the README file is relevant and needs to be there. If
+     something may be missing please let me know. Also, if there is extra
+     information, please edit the README so it will contain only the necessary
+     things."
+
+We provided the README and the course project instructions. The tool checked
+the README against the required repository deliverables: benchmark reports,
+execution scripts, supporting files, AI prompts, repository structure, and
+instructions for running the scripts.
+
+It condensed the README without changing any reported results. The final
+README keeps the project summary, performance table, hardware-verification
+result, repository layout, prerequisites, commands for the full and staged
+flows, measurement notes, and limitations. It also fixed unnecessary escaping
+in file names and shell commands, which could otherwise make commands harder
+to copy and paste.
+
+The review identified one follow-up item: `prompt.txt` must be included in the
+repository before submission, because the course instructions require the AI
+prompts or instructions to be documented. We created this file to meet that
+requirement.

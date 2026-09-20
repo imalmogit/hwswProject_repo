@@ -1,0 +1,750 @@
+================================================================================
+                        BENCHMARK REPORT -- nbody
+            HW/SW Co-design, Technion 00460882, project submission
+================================================================================
+
+CONTENTS
+    1. Overview
+    2. Initial Analysis
+    3. Optimizations
+    4. Performance Comparison
+    5. Hardware Acceleration Proposal
+    6. Conclusion
+
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+1.1 What the benchmark does
+---------------------------
+nbody is an n-body gravitational simulation taken from the Computer Language
+Benchmarks Game. It models five bodies -- the sun and the four gas giants --
+under Newtonian gravity.
+
+One benchmark call performs:
+
+    report_energy()             compute total system energy
+    advance(0.01, 20000)        20,000 timesteps of the integrator
+    report_energy()             compute total system energy again
+
+advance() is where essentially all the time goes. For each timestep it walks
+all 10 unordered body pairs, computes the separation vector and the
+gravitational term, updates both velocities, and then updates all five
+positions.
+
+    for i in range(n):
+        for (([x1, y1, z1], v1, m1),
+             ([x2, y2, z2], v2, m2)) in pairs:
+            dx = x1 - x2
+            dy = y1 - y2
+            dz = z1 - z2
+            mag = dt * ((dx * dx + dy * dy + dz * dz) ** (-1.5))
+            b1m = m1 * mag
+            b2m = m2 * mag
+            v1[0] -= dx * b2m
+            ...
+        for (r, [vx, vy, vz], m) in bodies:
+            r[0] += dt * vx
+            ...
+
+That inner body executes 200,000 times per benchmark call (20,000 timesteps x
+10 pairs) and performs roughly 27 floating-point operations each time, so about
+5.4 million floating-point operations per call.
+
+1.2 Libraries and modules
+--------------------------
+    pyperf          the timing harness. Calibrates the loop count, then runs
+                    20 independent worker processes with randomized memory
+                    layout and reports a mean and standard deviation.
+
+No third-party numeric library is used. All arithmetic is CPython's built-in
+float type. This matters for the analysis: every arithmetic result is a
+heap-allocated PyFloatObject.
+
+1.3 Data structures
+--------------------
+    BODIES      dict mapping body name -> (position, velocity, mass)
+    SYSTEM      list(BODIES.values()), the five bodies
+    PAIRS       list of the 10 unordered body pairs, precomputed once
+    position    list of 3 Python floats [x, y, z]   -- mutable, written in place
+    velocity    list of 3 Python floats [vx, vy, vz] -- mutable, written in place
+    mass        a Python float
+
+The choice of list for the 3-vectors is significant. Positions and velocities
+are updated in place via v1[0] -= ..., which goes through the generic Python
+sequence protocol on every access.
+
+1.4 Measurement environment
+----------------------------
+    Host CPU        Intel Xeon E5-2630 v3 @ 2.40 GHz (Haswell)
+    vCPUs           1
+    Guest           Ubuntu 22.04.5 LTS, kernel 5.15.0-1106-kvm (QEMU/KVM)
+    Interpreter     CPython 3.10.12, 64-bit, --with-pydebug, CFLAGS=-g -Og
+    Harness         pyperformance 1.14.0, pyperf 2.10.0
+    Profiler        perf 5.15.200
+
+Noise floor on this guest is roughly 2-3%. No improvement below that is
+claimed anywhere in this report.
+
+
+================================================================================
+2. INITIAL ANALYSIS
+================================================================================
+
+2.1 A correction to the measurement method
+-------------------------------------------
+The project guide profiles with
+
+    perf record -F 999 -g -- python3-dbg -m pyperformance run --bench <name>
+
+We started there and found it measures more than the benchmark. A single
+'pyperformance run' starts about 27 Python processes: pyperformance itself,
+four pip invocations, the pyperf manager, and 21 worker processes (one
+calibration plus 20 measurement workers). perf counts all of them.
+
+Summing every timed warmup and value recorded in the run's JSON output shows
+how much of that was actually benchmark code:
+
+    perf stat elapsed per run                     51.7 s
+    benchmark code across all 21 processes        40.2 s
+    share that is benchmark code                  77.9%
+    per-call instructions implied by that method   3.372 G
+    per-call instructions measured directly        2.909 G
+    over-count                                    +15.9%
+
+The contamination was visible directly in the profile, which contained samples
+from lsb_release, dpkg-query and uname -- programs the harness runs, not nbody.
+
+Three consequences: counters could not be compared between benchmarks, since
+one profile was 22% contaminated and the other 5%; an optimization would be
+under-reported, because the fixed harness cost does not shrink when the
+benchmark gets faster; and pyperf re-calibrates its loop count whenever a call
+drops below 100 ms, so the amount of work being counted could change silently
+between versions.
+
+2.2 The method we used instead
+-------------------------------
+perf is pointed at a single pyperf worker process with loops, warmups and
+values pinned on the command line:
+
+    python -u <bench>/run_benchmark.py --worker -l 1 -w 1 -n 100
+
+-l 1 reproduces the loop count pyperf's own calibration chose (the run
+metadata records loops = 1). -w 1 -n 100 means the process performs exactly
+101 benchmark calls and nothing else: no pip, no calibration, no manager.
+
+  *** Every nbody variant in this report uses -l 1 -w 1 -n 100, including  ***
+  *** the baseline. Changing N makes the counters describe a different     ***
+  *** amount of work and invalidates every comparison.                     ***
+
+Timing and counters come from different runs and are never mixed. Timing is
+the pyperformance mean across 20 processes, which answers "how much faster".
+Counters come from the fixed-work worker run, which answers "which
+instructions disappeared".
+
+2.3 A profiling trap on this guest
+-----------------------------------
+'perf record' without -e captured ZERO samples with no error message. The
+guest exposes an Intel PMU, so perf stat returns real cycle and instruction
+counts, but it does not deliver sampling interrupts. perf therefore opens the
+hardware 'cycles' event successfully, never falls back to a software event,
+and records nothing.
+
+All profiling in this project uses:
+
+    perf record -e cpu-clock -F 199 -g ...
+
+2.4 Validation of the method
+-----------------------------
+    task-clock explained by calls x pyperf mean        99.4%
+                                                       (101 x 477 ms = 48.18 s
+                                                        against 48.45 s)
+    per-call instructions, this run vs an independent   2.909 G vs 2.909 G
+    earlier run in a separate session                   (0.0% apart)
+    eval-loop share, same two runs                      45.56% vs 44.75%
+                                                       (0.81 points apart)
+    lost samples                                        0
+
+The first line is the important one: 99.4% of the process's CPU time is
+accounted for by the benchmark calls themselves. Under the guide's method that
+figure was 77.9%.
+
+The second and third lines are a repeatability check rather than a
+self-consistency one. The entire measurement was performed twice, days apart,
+in separate sessions, on separate clones of this repository. Per-call
+instructions agreed to four significant figures and the eval-loop share to
+0.8 percentage points, on a guest whose timing noise floor is 1.5%.
+
+The eval-loop share also sits where it was predicted to. In the contaminated
+baseline _PyEval_EvalFrameDefault was 37.09%; dividing by the 0.779 benchmark
+fraction predicts at most 47.6%, and the clean measurement gives 45.56%. It
+sits just below that ceiling because the harness processes run some interpreter
+loop of their own -- an independent confirmation that the 77.9% contamination
+estimate was right.
+
+2.5 Baseline results
+---------------------
+Timing (pyperformance mean over 20 processes):
+
+    nbody   477 ms +- 2 ms
+
+The whole measurement was repeated from scratch in a second session, on a
+fresh clone of this repository, and returned 477 ms and 2.909 G instructions
+per call again -- the same figures to four significant figures on a guest whose
+noise floor is 1.5%. Every number in this report comes from the second run;
+the first is not used, but the agreement is the strongest evidence that the
+method is repeatable.
+
+Hardware counters, fixed-work run, 101 calls, three repetitions:
+
+    task-clock                     48.45 s
+    time per call                  479.7 ms
+    instructions                   293.8 G      (2.909 G per call)
+    cycles                         115.5 G
+    IPC                            2.54
+    branches                       66.9 G       (22.8% of instructions)
+    branch-miss rate               0.48%
+    cache references               11.9 M       (0.040 per 1K instructions)
+    cache-miss rate                2.78%
+    LLC misses per 1K instructions 0.0011
+    page faults                    3,930
+    context switches               349
+
+What the counters say: nbody barely touches memory. Five bodies and their
+vectors fit comfortably in L1. The benchmark is bound by how many instructions
+the interpreter must execute, not by data movement. An accelerator aimed at
+memory traffic would gain nothing here.
+
+The branch figures need care. Both a 0.48% miss rate and 22.8% of instructions
+being branches are normal for a bytecode interpreter: most of those branches
+are the eval loop's own dispatch, running the same opcode sequence repeatedly.
+The low miss rate does not mean there is no dispatch cost to remove; it means
+the cost is issue bandwidth rather than misprediction.
+
+2.6 Profile and bottlenecks
+----------------------------
+Profile: 9,000 samples of cpu-clock at 199 Hz over 48.5 s, zero lost.
+Flame graph: results/_flamegraph/flamegraph_nbody.svg (462 distinct frames
+resolved, no raw addresses).
+
+Symbols grouped by mechanism. "Release-equiv" rescales by the share of the
+profile that is not debug-build-only code (3.35%), estimating what a normal
+interpreter would show. The Instr/call column applies each mechanism's share
+of SAMPLES to the total INSTRUCTIONS per call; that assumes IPC is roughly
+uniform across mechanisms, which is an approximation, so those figures are
+indicative rather than counted.
+
+    Mechanism                    Profile   Release-equiv   Instr/call
+    ---------------------------  --------  --------------  ----------
+    Interpreter dispatch          45.56%       47.1%         1.325 G
+    Sequence element access       12.34%       12.8%         0.359 G
+    Float boxing and refcounting  12.13%       12.6%         0.353 G
+    REAL FLOAT ARITHMETIC         10.69%       11.1%         0.311 G
+    Operator dispatch             10.07%       10.4%         0.293 G
+    Index to C integer             5.09%        5.3%         0.148 G
+    Debug-build only               3.35%     excluded        0.098 G
+    Uncategorised tail             0.70%        0.7%         0.020 G
+
+What each group contains:
+
+  Interpreter dispatch      _PyEval_EvalFrameDefault alone: bytecode fetch,
+                            decode and dispatch, and value-stack maintenance.
+
+  Float boxing              PyFloat_FromDouble (3.98%), float_dealloc (3.87%),
+                            get_float_state (1.47%), _Py_NewReference (1.41%),
+                            _Py_Dealloc (1.24%). Every intermediate value in
+                            dx*dx + dy*dy + dz*dz becomes a heap-allocated
+                            PyFloatObject that is refcounted and freed
+                            microseconds later. Allocating and destroying the
+                            result costs slightly more than computing it.
+
+  Real float arithmetic     float_mul (3.76%), float_add (2.41%),
+                            __ieee754_pow_fma in libm (1.81%),
+                            float_sub (1.78%), float_pow (0.84%), pow (0.09%).
+
+  Operator dispatch         binary_op1 (5.79%), PyNumber_Multiply (1.32%),
+                            binary_iop1 (1.22%), ternary_op (0.35%) and the
+                            rest of the PyNumber_* family. This is the
+                            deciding, at runtime and for every operation,
+                            which __mul__ applies to these two objects. The
+                            types never change across the entire run.
+
+  Sequence element access   list_ass_item (3.07%), list_ass_subscript (1.72%),
+                            list_item (1.63%), PyObject_GetItem (1.45%),
+                            PyObject_SetItem (1.40%), list_subscript (1.16%),
+                            listiter_next (0.97%), PyTuple_GetItem (0.85%):
+                            reading and writing r[0], v1[2] and similar through
+                            the generic sequence protocol.
+
+  Index to C integer        PyNumber_AsSsize_t (2.03%), _PyNumber_Index
+                            (1.80%), PyLong_AsSsize_t (1.26%): unwrapping the
+                            Python integer 0 into a C ssize_t before it can
+                            index anything. The indices are literals.
+
+  Debug-build only          _Py_CheckSlotResult (2.19%) plus the debug
+                            allocator's _PyMem_DebugCheckAddress (0.35%),
+                            read_size_t (0.20%), its memset fill (0.16%),
+                            write_size_t, the GIL check reached through
+                            pthread_getspecific, and validate_list. None of it
+                            exists in a release interpreter, and none of it is
+                            treated as a bottleneck.
+
+Key finding
+
+Only 11.1% of nbody's runtime is the floating-point arithmetic the algorithm
+requires. The other 88.9% is the cost of performing that arithmetic through a
+bytecode interpreter on boxed objects -- roughly eight instructions of overhead
+for every instruction of physics.
+
+Grouped differently: boxing (12.6%), element access (12.8%), operator dispatch
+(10.4%) and index conversion (5.3%) come to 41.1% of runtime. Every one of
+those exists only because values are generic heap objects reached through
+generic protocols. The types and shapes are fixed for the whole run -- five
+bodies, three coordinates, all doubles -- and the interpreter rediscovers that
+fact millions of times.
+
+Per floating-point operation, the interpreter spends 539 instructions.
+Compiled C spends 3.66 (section 4.4).
+
+Each row is that mechanism's share of the profile applied to the 539
+instructions, rounded to whole numbers, so the column sums to 537 rather
+than 539.
+
+    Mechanism                     Instructions per float op
+    ----------------------------  -------------------------
+    Interpreter dispatch                    245
+    Sequence element access                  66
+    Float boxing and refcounting             65
+    Real float arithmetic                     58
+    Operator dispatch                        54
+    Index to C integer                       27
+    Debug-build only                         18
+    Uncategorised tail                        4
+    ----------------------------  -------------------------
+    TOTAL                                   539
+    opt3, compiled C core                  3.66
+
+
+================================================================================
+3. OPTIMIZATIONS
+================================================================================
+
+Each variant is cumulative: opt2 contains opt1, opt3 contains opt2. Each was
+verified to reproduce the original's physics BEFORE any timing was taken
+(scripts/verify_nbody.py compares the final total energy after 20,000
+timesteps).
+
+3.1 opt1 -- hoist indexed reads into locals
+--------------------------------------------
+Targets: sequence element access (12.8% of runtime).
+
+The inner loop reads and writes v1[0], v1[1], v1[2] through the generic
+sequence protocol on every pair iteration. Unpacking each vector into locals
+once replaces three BINARY_SUBSCR operations with one UNPACK_SEQUENCE.
+
+    BEFORE                          AFTER
+    v1[0] -= dx * b2m               v1x, v1y, v1z = v1
+    v1[1] -= dy * b2m               v2x, v2y, v2z = v2
+    v1[2] -= dz * b2m               v1[0] = v1x - dx * b2m
+    v2[0] += dx * b1m               v1[1] = v1y - dy * b2m
+    v2[1] += dy * b1m               v1[2] = v1z - dz * b2m
+    v2[2] += dz * b1m               v2[0] = v2x + dx * b1m
+                                    v2[1] = v2y + dy * b1m
+                                    v2[2] = v2z + dz * b1m
+
+The same transformation is applied to the position-update loop.
+
+Verification: final energy is BIT-EXACT with the original.
+
+3.2 opt2 -- math.sqrt in place of the generic pow
+--------------------------------------------------
+Targets: the generic pow path. In opt1, which is what this change is applied
+to, __ieee754_pow_fma (1.84%), float_pow (1.17%) and libm's pow (0.14%) come
+to 3.2% of runtime. That is the whole budget available to this optimization.
+
+    BEFORE  mag = dt * ((dx*dx + dy*dy + dz*dz) ** (-1.5))
+    AFTER   d2  = dx*dx + dy*dy + dz*dz
+            mag = dt / (d2 * sqrt(d2))
+
+Mathematically equivalent for d2 > 0. The intent was to replace CPython's
+generic BINARY_POWER, which routes through libm's pow(), with a single
+hardware square root.
+
+Verification: final energy differs by 9.5e-15 relative, the expected
+last-ulp difference from the reassociation. Well inside any tolerance.
+
+This optimization made the benchmark slower; see section 4.2.
+
+3.3 opt3 -- Cython typed core
+------------------------------
+Targets: boxing, operator dispatch, element access and index conversion
+(41.1% of runtime), plus interpreter dispatch as a side effect.
+
+External tool: Cython 3.x, compiling to C.
+
+The entire advance() loop is moved into a typed Cython function operating on
+C doubles held in fixed C arrays. report_energy() and offset_momentum() stay
+in Python, so only the hot loop is compiled.
+
+    # cython: boundscheck=False, wraparound=False, cdivision=True
+    from libc.math cimport sqrt
+
+    def advance_c(double dt, int n, list bodies):
+        cdef double pos[16][3]
+        cdef double vel[16][3]
+        cdef double mass[16]
+        ...
+        # marshal in from the Python lists once
+        # run all n timesteps entirely on C doubles
+        # marshal out once at the end
+
+The pair iteration order (0,1),(0,2),...,(n-2,n-1) matches combinations() in
+the original, so floating-point accumulation order is preserved.
+
+This is the software analogue of the hardware proposal: values live unboxed in
+registers, types are known at compile time, and indices are C integers.
+
+Verification: final energy matches opt2 exactly, 9.5e-15 from the original.
+
+
+================================================================================
+4. PERFORMANCE COMPARISON
+================================================================================
+
+4.1 Summary
+------------
+    Variant       Time/call   vs base    Instr/call   vs base    IPC
+    ------------  ----------  ---------  -----------  ---------  ----
+    baseline        477 ms        --       2.909 G       --      2.54
+    opt1            428 ms      -10.3%     2.662 G     -8.5%     2.58
+    opt2            444 ms       -6.9%     2.765 G     -4.9%     2.59
+    opt3 (Cython)  3.81 ms      -99.2%    0.0197 G    -99.3%     1.86
+
+    opt3's instruction figure is the regression slope of section 4.4, not
+    total/101. Its IPC is measured over the whole worker process, most of
+    which is interpreter startup, so it is not comparable with the rows above.
+
+Timing and instruction counts move together in every row, which is the first
+check that a result is real work removed rather than scheduling noise.
+
+The project requires at least 7% improvement on two benchmarks. nbody opt1
+delivers 10.3% and opt3 delivers 99.2%; pyflate (see report_pyflate.txt)
+delivers 16.2%.
+
+4.2 opt1 attribution
+---------------------
+    Mechanism                  baseline    opt1      change
+    -------------------------  ---------  --------  -----------------
+    Sequence element access     0.359 G   0.169 G   -0.190 G  (-53%)
+    Index to C integer          0.148 G   0.071 G   -0.078 G  (-52%)
+    Interpreter dispatch        1.325 G   1.396 G   +0.071 G
+                                                    -----------------
+    NET of these three                              -0.197 G
+
+Measured difference: -0.247 G per call. The three mechanisms above account for
+80% of it; the remainder is spread across boxing (-0.001 G), operator dispatch
+(-0.025 G), arithmetic (-0.008 G) and the debug-only bucket (-0.020 G), none of
+which was targeted and all of which fall slightly because there are fewer
+operations in total.
+
+The index-conversion drop was not designed for: fewer subscripts means fewer
+Python integers unwrapped into C ssize_t. Dispatch rose because the unpack adds
+bytecodes, but cheaper ones -- the eval loop's share of the profile rises from
+45.6% to 52.5% while its absolute instruction count rises only 5%, because the
+denominator shrank. Time fell 10.3% against 8.5% fewer instructions because IPC
+also improved, 2.54 to 2.58.
+
+4.3 opt2 -- a measured regression, fully accounted
+---------------------------------------------------
+opt2 is 3.7% SLOWER than opt1 and executes 103 M more instructions per call.
+Since opt2 is opt1 plus one change, the comparison isolates that change
+exactly.
+
+    Mechanism                  opt1      opt2      change
+    -------------------------  --------  --------  -----------------
+    Real float arithmetic      0.303 G   0.244 G   -0.059 G  <- the win
+    math.sqrt call path        0.024 G   0.104 G   +0.080 G
+    Interpreter dispatch       1.396 G   1.432 G   +0.036 G
+    Debug-build only           0.077 G   0.095 G   +0.018 G
+    Index to C integer         0.071 G   0.086 G   +0.016 G
+    Sequence element access    0.169 G   0.181 G   +0.012 G
+    Operator dispatch          0.268 G   0.272 G   +0.004 G
+    Float boxing               0.352 G   0.348 G   -0.004 G
+                                                   -----------------
+    NET                                            +0.103 G
+
+Measured difference: +0.103 G. The accounting is complete to 0.3%.
+
+The symbols confirm the mechanism exactly. In opt1 the pow path is
+__ieee754_pow_fma (1.84%), float_pow (1.17%) and libm pow (0.14%) -- 3.15% of
+runtime. In opt2 all three are GONE, replaced by __sqrt_finite (0.08%) and
+__sqrt (0.01%). The arithmetic really did get cheaper, by 0.059 G, which is
+2.2% of opt1's instructions against a 3.2% budget; the shortfall is float_div
+(0.74%), because the new formula divides where the old one multiplied.
+
+So roughly two thirds of the available win was collected, and the program still
+lost, because expressing the cheaper formula in Python cost:
+
+    a Python-level function call     call_function 0.78%,
+                                     cfunction_vectorcall_O 0.34%,
+                                     _PyObject_VectorcallTstate 0.21%,
+                                     _Py_CheckFunctionResult 0.14%
+    the math module's dispatch       math_1_to_whatever 0.53%, math_sqrt 0.07%
+    a global name lookup             lookdict_unicode_nodummy 0.44%,
+                                     _PyDict_LoadGlobal 0.24%
+    unboxing the argument            PyFloat_AsDouble 0.11%
+    two extra boxed temporaries      sqrt(d2) and d2*sqrt(d2), per iteration
+
+0.080 G spent on the call path against 0.059 G saved on the arithmetic, then
+0.068 G more in dispatch, indexing and element access as the extra bytecodes
+ripple outward, and 0.018 G in debug-build-only code that a release interpreter
+would not execute. Increases total 0.166 G against a 0.063 G saving, or about
+515 extra instructions per pair iteration.
+
+This is the most useful result in the project. The arithmetic was never the
+bottleneck, so making it cheaper bought 0.059 G while the interpreter charged
+0.166 G to say it -- 0.148 G of that on a release build, once the debug-only
+row is dropped, which still loses by more than twice the saving. It is also a direct design constraint on any hardware
+proposal: an accelerator whose invocation path costs more than the work it
+replaces is a net loss, and here that outcome was measured rather than
+argued.
+
+4.4 opt3 -- and the measurement correction it forced
+------------------------------------------------------
+opt3 was fast enough to break the fixed-work measurement. Its worker process
+reported 2.736 G instructions over 101 calls, which divides to 27.1 M per call
+-- but the benchmark's own time (101 x 3.82 ms = 386 ms) against the process's
+617 ms of task-clock showed that 37% of the measurement was interpreter
+STARTUP, not the benchmark. The profile names it directly: r_object and
+r_string (unmarshalling bytecode during import), type_call, tupledealloc and
+the dict lookups of module initialisation.
+
+This is the same contamination removed in section 2.1, reappearing because the
+benchmark shrank by two orders of magnitude.
+
+The fix is to measure the slope rather than assume the intercept is zero.
+Running the same worker at three values of N and fitting
+
+    instructions = startup + calls x per_call
+
+on the two smaller points, holding the third back as a check:
+
+    calls   instructions      task-clock
+       21   1,157,153,533     308.56 ms
+       61   1,947,033,411     464.37 ms
+      101   2,735,572,499     617.02 ms      <- held out
+
+    startup (intercept)                      742.5 M instructions, 226.8 ms
+    per call (slope)                         19.747 M instructions, 3.895 ms
+    naive total/101 figure                   27.085 M, inflated by +37.2%
+                                             6.109 ms, inflated by +56.8%
+    prediction error on the held-out point   +0.05% instructions, +0.51% time
+    slope time vs independent pyperf mean    3.895 vs 3.82 ms, 2.0% apart
+
+Two independent confirmations sit in that table. The fit predicts a point it
+was not fitted on to within 0.05%, and its time slope agrees to 2% with the
+pyperf mean, which comes from 20 separate processes through completely
+different machinery.
+
+The corrected figures are 0.0197 G instructions and 3.82 ms per call: 147x
+fewer instructions and 125x faster than the baseline.
+
+For scale: the baseline's float-arithmetic bucket ALONE is 0.311 G per call,
+which is 16x more than opt3's entire per-call cost. Even the work that looked
+like genuine computation was roughly 94% object plumbing.
+
+4.5 Amdahl scorecard
+---------------------
+Ceilings are release-equivalent shares, as in section 2.6: the debug-only
+bucket is excluded before the fraction is taken, so the bound describes a
+normal interpreter rather than this one.
+
+    Optimization  Targeted                      Ceiling   Measured        Verdict
+    ------------  ----------------------------  --------  --------------  --------------
+    opt1          element access + index conv    18.1%    -8.5% instr     held
+                                                          -10.3% time
+    opt2          the generic pow path            3.2%    arithmetic fell held, but only
+                                                          2.2%,           2/3 of ceiling;
+                                                          net +3.7% slower negative result
+    opt3          boxing, dispatch, indexing     41.1%    -99.3% instr,   far exceeded
+                                                (1.70x)   125x faster
+
+Why opt3 exceeded its ceiling. Amdahl's law bounds what happens when the
+targeted fraction goes to zero AND EVERYTHING ELSE IS UNCHANGED. Cython changes
+everything else too: it removes interpreter dispatch as well (47.1% of the
+baseline, which the hardware proposal does not target), and it makes the
+surviving arithmetic natively fast, because a C double multiply is one
+instruction where CPython's float_mul carries allocation, refcounting and type
+dispatch around the same operation.
+
+The lesson for the hardware argument: an accelerator that only removes boxing
+and dispatch, leaving the bytecode loop intact, is correctly bounded at 1.70x.
+Reaching anything like opt3's result requires removing the interpretation
+itself, which is a far larger architectural change than adding a functional
+unit.
+
+
+================================================================================
+5. HARDWARE ACCELERATION PROPOSAL
+================================================================================
+
+Scope note. The implemented accelerator for this project targets pyflate, not nbody.
+Verilog RTL, a self-checking testbench and a full specification are in
+hardware/ and documented in report_pyflate.txt section 5. The nbody proposal
+below is developed as an analysis, and the project specification permits one
+or two proposed components.
+
+5.1 Typed Float Unit -- concept
+--------------------------------
+The interpreter re-derives the same facts on each of 5.4 M operations per call:
+that both operands are doubles, which __mul__ applies, that the index literal
+is a small integer, and that the result must become a heap object.
+
+The unit caches the resolved operand type pair per bytecode site and, on a hit,
+computes on raw doubles held in an internal register file, boxing only when a
+value escapes to Python.
+
+5.2 Inputs and outputs
+-----------------------
+Two new opcodes. The value stack is extended so a slot holds either a
+PyObject* or a tag naming a register inside the unit.
+
+    Opcode      Inputs                                 Outputs
+    ----------  -------------------------------------  ---------------------
+    FPU_OP      site id (16 bit), operation (3 bit),   register tag (5 bit),
+                two stack slots (64 bit each)          or deopt signal
+    FPU_INDEX   site id (16 bit), list object (64      register tag (5 bit),
+                bit), constant index (8 bit)           or deopt signal
+
+A "site id" is the bytecode offset within a code object. That is what makes
+the type cache possible: the same site sees the same types on every execution
+of a numeric loop.
+
+5.3 Block diagram
+------------------
+    Opcode + site id
+           |
+           v
+    +----------------+   miss    +------------------------+
+    | Site type cache|---------->| Deopt to generic path  |
+    +----------------+           +------------------------+
+           | hit                              ^
+           v                                  |
+    +----------------+   guard fails          |
+    | Guard: operands|------------------------+
+    | still double?  |
+    +----------------+
+           | pass
+           v
+    +----------------+     +------------------+
+    | Unbox / read   |---->| FP ALU           |
+    | FP register    |     | add sub mul div  |
+    +----------------+     | rsqrt            |
+                           +------------------+
+                                   |
+                                   v
+                           +------------------+
+                           | Tagged FP        |
+                           | register file    |
+                           +------------------+
+                                   |
+                         escapes?  |
+                    no  +----------+----------+  yes
+                        v                     v
+              +-----------------+   +-----------------------+
+              | Return reg tag  |   | Box: PyFloat_FromDouble|
+              +-----------------+   +-----------------------+
+
+5.4 Performance bound
+----------------------
+The unit addresses boxing (0.353 G), sequence element access (0.359 G),
+operator dispatch (0.293 G) and index conversion (0.148 G): 1.153 G of the
+baseline's 2.909 G instructions per call. That is 39.6% of the measured
+profile, or 41.1% once debug-build-only code is excluded -- an Amdahl ceiling
+of 1.70x release-equivalent. It will not reach that, because guards and tag
+management are not free.
+
+    If the unit eliminates    Runtime cut    Speedup
+    -----------------------   ------------   -------
+    60% of addressable work      24.7%        1.33x
+    70%                          28.8%        1.40x
+    80%                          32.9%        1.49x
+    90%                          37.0%        1.59x
+
+Two measurements anchor this. opt1 removed part of the element-access cost in
+software alone and delivered 10.3%. opt3 removed the whole addressable set PLUS
+interpreter dispatch and got 125x, which shows the target is real work rather
+than a measurement artifact, and simultaneously shows why this unit is capped
+near 1.70x: it leaves the 245 instructions per operation of bytecode dispatch
+untouched.
+
+5.5 Trade-offs
+---------------
+AREA      A 1024-entry site cache at 8 bytes per entry is 8 KB; the register
+          file is 32 doubles, 256 bytes; plus guard and bounds-check logic.
+          Small beside an L1 cache, and shared by every numeric loop rather
+          than replicated.
+
+POWER     Active only while participating opcodes issue. Idle on non-numeric
+          code.
+
+ENERGY    The defensible claim, rather than peak power. The same 5.4 M
+          floating-point operations complete in far fewer cycles, so energy
+          per operation falls even if instantaneous power rises while the unit
+          is active.
+
+FAILURE   A polymorphic site thrashes the cache and pays the guard on every
+MODES     miss. A value that escapes immediately is boxed anyway, so boxing is
+          deferred rather than avoided. The cache must be invalidated when a
+          type changes. Because nbody runs the same five bodies for 20,000
+          timesteps, this workload is close to the best case, and the report
+          should say so rather than generalize.
+
+THE opt2  The issue path must cost less than the work it replaces. opt2
+CONSTRAINT measured what happens when it does not. FPU_OP must be a real opcode
+          in the dispatch loop, not a C function call.
+
+
+================================================================================
+6. CONCLUSION
+================================================================================
+
+nbody spends 11.1% of its runtime on the floating-point arithmetic the
+algorithm requires and 88.9% on the cost of expressing that arithmetic through
+a bytecode interpreter operating on boxed objects. Per floating-point
+operation, CPython executes 539 instructions where compiled C executes 3.66.
+
+Three software optimizations were measured against a fixed-work baseline:
+
+    opt1  hoisting indexed reads into locals       -10.3%
+    opt2  math.sqrt in place of the generic pow     +3.7% (SLOWER)
+    opt3  Cython typed core                        -99.2%
+
+opt1 met the project's 7% threshold and 80% of its gain is attributed to the
+two mechanisms it targeted, with the rest spread across untargeted buckets
+that shrink simply because there are fewer operations.
+
+opt2 is the most instructive result. The arithmetic genuinely did get cheaper
+-- the entire libm pow path disappears from the profile and the bucket falls
+by 0.059 G instructions, two thirds of the 3.2% budget the profile said was
+available -- and the program still slowed by 3.7%, because a Python-level
+function call, the math module's dispatch, a global lookup and two extra boxed
+temporaries cost 0.080 G to say it, with another 0.064 G rippling into
+dispatch and indexing. Collecting most of a ceiling is not the same as winning.
+
+opt3 demonstrates what removing the interpretation entirely achieves: 147x
+fewer instructions. It also forced a second measurement correction, because at
+3.82 ms per call the process startup that had been negligible became 37% of the
+measurement. Measuring the slope across three values of N recovered the true
+per-call figure, with the fit predicting a held-out point to 0.05% and its time
+slope agreeing to 2% with an independent 20-process timing run.
+
+For hardware, the Typed Float Unit is bounded at 1.70x because it removes
+boxing, operator dispatch and indexing but leaves bytecode dispatch intact.
+The gap between that 1.70x and opt3's 125x is the measured difference between
+adding a functional unit and removing interpretation -- which is the central
+HW/SW co-design finding of this project.
+
+The implemented accelerator targets pyflate, where the operation is compact
+enough to specify and verify completely in RTL. See report_pyflate.txt.

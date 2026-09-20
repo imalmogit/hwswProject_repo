@@ -1,0 +1,704 @@
+================================================================================
+                       BENCHMARK REPORT -- pyflate
+            HW/SW Co-design, Technion 00460882, project submission
+================================================================================
+
+CONTENTS
+    1. Overview
+    2. Initial Analysis
+    3. Optimizations
+    4. Performance Comparison
+    5. Hardware Acceleration Proposal  (IMPLEMENTED IN VERILOG)
+    6. Conclusion
+
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+1.1 What the benchmark does
+---------------------------
+pyflate is a stand-alone, pure-Python DEFLATE (gzip) and bzip2 decompressor
+written by Paul Sladen. The pyperformance benchmark decompresses the bundled
+file data/interpreter.tar.bz2 -- 67,562 bytes in, 399,360 bytes out -- and
+verifies the result against a fixed MD5 digest:
+
+    if hashlib.md5(out).hexdigest() != "afa004a630fe072901b1d9628b960974":
+        raise Exception("MD5 checksum mismatch")
+
+That self-check is useful for this project: any optimization that corrupts the
+decode fails immediately rather than silently producing a wrong "faster"
+result.
+
+Scope: the DEFLATE path never executes for this benchmark input.
+
+bench_pyflake reads the file's 16-bit magic and dispatches on it:
+
+    magic = field.readbits(16)
+    if magic == 0x1f8b:      # GZip
+        out = gzip_main(field)
+    elif magic == 0x425a:    # BZip2
+        out = bzip2_main(field)
+
+The data file is bzip2, so only bzip2_main runs. The entire DEFLATE half of the
+module -- including the much-discussed back-reference copy
+'out += out[-distance:]' -- is dead code for this benchmark. We initially
+attributed the profile's list-operation cost to that line and were wrong; the
+correction is documented in section 2.6.
+
+1.2 The bzip2 decode pipeline
+------------------------------
+    1. Huffman decode        find_next_symbol() pulls one symbol at a time from
+                             the bit stream, using one of 2-6 tables that
+                             rotate every 50 symbols.
+    2. Move-to-front (MTF)   each decoded symbol indexes a table of byte
+                             values; the selected entry is emitted and promoted
+                             to the front of the table.
+    3. Inverse BWT           bwt_reverse() undoes the Burrows-Wheeler
+                             transform.
+    4. Final RLE             a run-length decoding pass produces the output.
+
+Stages 1 and 2 execute once per decoded symbol and dominate the profile.
+Measured on the test file: 89,837 MTF operations on a 145-entry table.
+
+1.3 Libraries and modules
+--------------------------
+    hashlib    MD5 verification of the decompressed output
+    struct     int2byte = struct.Struct(">B").pack, used to build byte values
+    os         locating the bundled data file
+    pyperf     the timing harness
+
+No compression library is used -- that is the point of the benchmark. Every
+bit operation, Huffman lookup and transform is pure Python.
+
+1.4 Data structures
+--------------------
+    RBitfield          an MSB-first bit reader over the input file. Holds an
+                       arbitrary-precision Python int as the bit accumulator
+                       and shifts/masks it on every read.
+    HuffmanTable       a list of HuffmanLength objects, sorted by (bits, code).
+                       Each HuffmanLength carries .code, .bits, .symbol and
+                       .reverse_symbol as Python attributes.
+    favourites         a LIST of single-byte bytes objects, up to 256 entries.
+                       This is the move-to-front table. 145 entries for the
+                       test file.
+    buffer / out       lists of bytes fragments, joined at the end.
+    selectors_list     a list of small ints choosing the active Huffman table.
+
+The choice of a Python list for 'favourites' is what this report's hardware
+proposal targets.
+
+1.5 Measurement environment
+----------------------------
+    Host CPU        Intel Xeon E5-2630 v3 @ 2.40 GHz (Haswell)
+    vCPUs           1
+    Guest           Ubuntu 22.04.5 LTS, kernel 5.15.0-1106-kvm (QEMU/KVM)
+    Interpreter     CPython 3.10.12, 64-bit, --with-pydebug, CFLAGS=-g -Og
+    Harness         pyperformance 1.14.0, pyperf 2.10.0
+    Profiler        perf 5.15.200
+
+Noise floor on this guest is roughly 2-3%. pyflate raised
+"WARNING: the benchmark result may be unstable" in two of nine baseline runs.
+
+
+================================================================================
+2. INITIAL ANALYSIS
+================================================================================
+
+2.1 Measurement method
+-----------------------
+The method correction described in report_nbody.txt section 2.1 applies here
+too, though pyflate was far less affected because its benchmark calls are long:
+
+    perf stat elapsed per run                    277.8 s
+    benchmark code across all 21 processes       263.6 s
+    share that is benchmark code                  94.9%
+    per-call instructions implied by that method  17.053 G
+    per-call instructions measured directly       16.784 G
+    over-count                                     +1.6%
+
+All measurements in this report use a single fixed-work worker process:
+
+    python -u <bench>/run_benchmark.py --worker -l 1 -w 1 -n 20
+
+which performs exactly 21 benchmark calls and nothing else.
+
+  *** Every pyflate variant in this report uses -l 1 -w 1 -n 20, including ***
+  *** the baseline. Changing N invalidates every comparison.               ***
+
+Profiling uses -e cpu-clock -F 199 explicitly. Without -e, perf on this guest
+captures ZERO samples with no error (see report_nbody.txt section 2.3).
+
+2.2 Baseline results
+---------------------
+Timing (pyperformance mean over 20 processes):
+
+    pyflate   3.14 s +- 0.02 s
+
+The whole measurement was repeated from scratch in a second session, on a
+fresh clone of this repository. The mean came back identical at 3.14 s and
+per-call instructions within 0.8% (16.610 G against 16.743 G), on a guest
+whose noise floor is 2.5%. Every figure in this report is from the second run.
+
+Hardware counters, fixed-work run, 21 calls, three repetitions:
+
+    task-clock                     66.24 s
+    time per call                  3154.3 ms
+    instructions                   348.8 G      (16.610 G per call)
+    cycles                         157.8 G
+    IPC                            2.20
+    branches                       86.4 G       (24.8% of instructions)
+    branch-miss rate               0.49%
+    cache references               171.1 M      (0.491 per 1K instructions)
+    cache-miss rate                7.79%
+    LLC misses per 1K instructions 0.0381
+    page faults                    127,912
+    context switches               494
+
+2.3 What the counters say
+--------------------------
+pyflate is the opposite shape to nbody. It issues 12x more cache references
+per instruction (0.491 against 0.040) and misses 2.8x more often (7.79% against
+2.78%), for 35x the last-level miss rate. Its 127,912 page faults against
+nbody's 3,930 show the same thing from the allocator's side.
+
+This is the quantitative basis for treating pyflate as a data-movement problem
+and nbody as a compute problem, and it is what makes an accelerator that
+removes object churn the right kind of proposal here.
+
+2.4 Profile
+------------
+Profile: 13,000 samples of cpu-clock at 199 Hz over 66.6 s, zero lost.
+Flame graph: results/_flamegraph/flamegraph_pyflate.svg
+
+The Instr/call column applies each mechanism's share of SAMPLES to the total
+INSTRUCTIONS per call, which assumes roughly uniform IPC across mechanisms.
+Those figures are indicative rather than counted.
+
+    Mechanism                    Profile   Release-equiv   Instr/call
+    ---------------------------  --------  --------------  ----------
+    Interpreter dispatch          24.02%       29.4%        3.990 G
+    Function call machinery       10.00%       12.2%        1.661 G
+    List and slice operations      9.57%       11.7%        1.590 G
+    Memory allocator               5.56%        6.8%        0.924 G
+    Integer and bit operations     4.19%        5.1%        0.696 G
+    Dict lookup                    3.86%        4.7%        0.641 G
+    Operator dispatch              2.47%        3.0%        0.410 G
+    Tuple access                   1.52%        1.9%        0.253 G
+    DEBUG-BUILD ONLY              18.31%     excluded       3.041 G
+    Uncategorised tail            20.41%       25.0%        3.390 G
+
+2.5 Debug-build correction
+---------------------------
+
+18.31% of the samples are code that exists only because the interpreter was
+built --with-pydebug. Four of the five largest symbols after the eval loop are
+debug-allocator functions:
+
+    _PyMem_DebugCheckAddress        3.85%
+    read_size_t                     2.94%
+    __memset_avx2_unaligned_erms    2.82%   (writing marker bytes)
+    pthread_getspecific             1.92%   (the debug GIL check)
+    _PyMem_DebugRawAlloc            1.24%
+    write_size_t                    1.21%
+    PyGILState_Check                1.21%
+    ... plus the remaining debug allocator entry points
+
+The call graphs from the first capture confirm the attribution directly:
+memset is reached from _PyMem_DebugRawFree and _PyMem_DebugRawAlloc writing
+marker bytes, and pthread_getspecific from _PyMem_DebugCheckGIL. In CPython
+3.10 these hooks are installed only when Py_DEBUG is defined (Objects/obmalloc.c).
+
+An analysis that skips this correction concludes that pyflate is
+allocation-bound for a reason that vanishes on a normal interpreter. The
+"Release-equiv" column above divides each mechanism by 0.8169, the non-debug
+share, to estimate what a release build would show.
+
+2.6 Bottlenecks -- and a correction to our own first analysis
+--------------------------------------------------------------
+Our first pass attributed the list-operation cost to the DEFLATE back-reference
+copy 'out += out[-distance:]'. That was WRONG: as section 1.1 explains, the
+DEFLATE path never runs for this data file. Reading the source to write the
+optimization is what caught it.
+
+The real source is the bzip2 move-to-front stage:
+
+    def move_to_front(l, c):
+        l[:] = l[c:c + 1] + l[0:c] + l[c + 1:]
+
+Called once per decoded symbol. Three slices, two concatenations and a slice
+assignment, over a list of up to 256 entries, to move ONE element to the
+front. That is five list allocations and roughly 1,450 refcounted pointer
+copies per call.
+
+The profile symbols match exactly: list_dealloc (2.41%), list_ass_slice
+(2.09%), list_item (1.28%), list_slice (1.21%), list_concat (1.09%),
+listiter_next (0.41%), list_subscript (0.28%). All five slicing symbols
+collapse in opt1, which is how we know the attribution is right rather than
+merely plausible.
+
+    Bottleneck 1 -- move-to-front (list + allocator)   18.5% release-equiv
+    Bottleneck 2 -- Huffman symbol search              dict lookup + call
+                                                       machinery
+    Bottleneck 3 -- bit reading on arbitrary-precision  5.1% release-equiv
+                    Python integers
+
+On bottleneck 2: find_next_symbol scans the symbol table LINEARLY, calling
+snoopbits for each candidate and touching three Python attributes per entry:
+
+    for x in self.table:
+        if cached_length != x.bits:
+            cached = field.snoopbits(x.bits)
+            cached_length = x.bits
+        if (reversed and x.reverse_symbol == cached) or ...
+
+The benchmark's own docstring concedes the point: "there is certainly some
+room for improvement in the Huffman bit-matcher".
+
+Measured MTF traffic, captured by instrumenting move_to_front during a real
+decode (hardware/gen_stimulus.py):
+
+    MTF calls per benchmark call        89,837
+    table size                          145 entries
+    instructions per MTF call           approximately 21,400
+    time in the MTF stage               368 ms of 3,140 ms (release-equiv)
+
+The instructions-per-call figure is measured, not estimated. opt1 changes
+move_to_front and nothing else, and it removes 1.924 G instructions per
+benchmark call; divided by 89,837 operations that is 21,415 instructions per
+move-to-front. It is a lower bound on the original cost, because the in-place
+version still does a pop and an insert.
+
+
+================================================================================
+3. OPTIMIZATIONS
+================================================================================
+
+Each variant is cumulative. Each was verified to reproduce the benchmark's own
+MD5 digest BEFORE any timing was taken (scripts/verify_pyflate.py).
+
+3.1 opt1 -- in-place move-to-front
+-----------------------------------
+Targets: the MTF list operations and the allocator underneath them
+(18.5% release-equiv).
+
+    BEFORE                                       AFTER
+    def move_to_front(l, c):                     def move_to_front(l, c):
+        l[:] = l[c:c+1] + l[0:c] + l[c+1:]           l.insert(0, l.pop(c))
+
+Semantically identical: both move the element at index c to position 0 and
+preserve the order of everything else. The rewrite replaces five list
+allocations and a full rebuild with two memmoves inside one list object, and
+allocates nothing.
+
+No external library. This is the software analogue of the hardware proposal in
+section 5.
+
+Verification: MD5 digest matches.
+
+3.2 opt2 -- table-driven Huffman decode
+----------------------------------------
+Targets: the Huffman symbol search (dict lookup and call machinery).
+
+self.table is already sorted by (bits, code), so grouping it by code length
+preserves the ascending-length search order while replacing the per-entry
+scan with one dictionary lookup per distinct length.
+
+    def build_lookup(self):
+        fwd, rev = [], []
+        for x in self.table:
+            if not fwd or fwd[-1][0] != x.bits:
+                fwd.append((x.bits, {})); rev.append((x.bits, {}))
+            fwd[-1][1].setdefault(x.symbol, x.code)
+            rev[-1][1].setdefault(x.reverse_symbol, x.code)
+        self._lookup_fwd, self._lookup_rev = fwd, rev
+
+    def find_next_symbol(self, field, reversed=True):
+        groups = self._lookup_rev if reversed else self._lookup_fwd
+        snoopbits = field.snoopbits
+        for bits, table in groups:
+            code = table.get(snoopbits(bits))
+            if code is not None:
+                field.readbits(bits)
+                return code
+        raise Exception(...)
+
+build_lookup() is called wherever populate_huffman_symbols() is called, plus
+for the two static tables in the DEFLATE path that never call it (kept correct
+even though that path is unused here).
+
+No external library. Trades a small one-off table build per block for a large
+per-symbol saving.
+
+Verification: MD5 digest matches.
+
+
+================================================================================
+4. PERFORMANCE COMPARISON
+================================================================================
+
+4.1 Summary
+------------
+    Variant                  Time/call   vs base    Instr/call   vs base   IPC
+    -----------------------  ----------  ---------  -----------  --------  ----
+    baseline                   3.14 s       --       16.610 G       --     2.20
+    opt1 (in-place MTF)        2.74 s     -12.7%     14.686 G    -11.6%    2.24
+    opt2 (+ Huffman table)     2.63 s     -16.2%     13.943 G    -16.1%    2.20
+
+    Against opt1 rather than the baseline, opt2 is a further -4.0% in time and
+    -5.1% in instructions.
+
+Timing and instruction counts move together, so the gains are real work
+removed. Both variants clear the project's 7% threshold.
+
+4.2 opt1 attribution
+---------------------
+    Mechanism                  baseline    opt1      change
+    -------------------------  ---------  --------  -----------------
+    List / slice (MTF)          1.590 G   0.447 G   -1.143 G  (-72%)
+    Debug-build-only code       3.041 G   2.720 G   -0.321 G
+    Dict lookup                 0.641 G   0.458 G   -0.183 G
+    Function call machinery     1.661 G   1.570 G   -0.091 G
+    Memory allocator            0.924 G   0.840 G   -0.084 G
+    Integer and bit operations  0.696 G   0.745 G   +0.049 G
+                                                    -----------------
+    NET of these six                                -1.773 G
+
+Measured difference: -1.924 G per call. The six mechanisms above account for
+92% of it; the rest is spread thinly across the tail.
+
+72% of the move-to-front cost removed, exactly the mechanism targeted. Every
+slicing symbol collapses: list_ass_slice 2.09% -> 0.05%, list_concat 1.09% ->
+absent, list_slice 1.21% -> absent, list_dealloc 2.41% -> 0.25%. What survives
+is list_item at 1.32%, which is the table read the accelerator would replace.
+The +0.049 G on integers is method resolution for l.pop and l.insert -- a cheap
+price for the allocations avoided.
+
+Release-build caveat: 0.321 G of the gain is debug-allocator work that does
+not exist in a release interpreter, so 17% of the measured improvement would
+not appear on a normal Python.
+
+4.3 opt2 attribution -- the right result for the wrong reason
+---------------------------------------------------------------
+    Mechanism                  opt1      opt2      change
+    -------------------------  --------  --------  -----------------
+    Interpreter dispatch       3.936 G   3.249 G   -0.687 G
+    Integer and bit operations 0.745 G   0.622 G   -0.123 G
+    Tuple access               0.283 G   0.243 G   -0.041 G
+    Operator dispatch          0.386 G   0.353 G   -0.033 G
+    Dict lookup (Huffman)      0.458 G   0.467 G   +0.009 G
+    Function call machinery    1.570 G   1.754 G   +0.184 G
+                                                   -----------------
+    NET of these six                               -0.691 G
+
+Measured difference: -0.743 G per call.
+
+We predicted this would reduce dict lookup cost. It did not: dict lookup rose
+very slightly, by 0.009 G, and the call machinery rose by 0.184 G, because
+dict.get() is a method call where the old code was an inline comparison.
+
+The real win was eliminating the interpreted loop itself: 0.687 G of the
+0.743 G saved, 92% of the improvement, is interpreter dispatch. find_next_symbol
+ran a Python 'for' over the symbol table, executing bytecodes for every
+candidate before reaching a match. A dictionary get() removes the loop, not
+merely the comparisons inside it -- and it is worth paying 0.184 G of extra call
+machinery to do so.
+
+The prediction was wrong in mechanism while right in direction, and the profile
+is what caught it. This is reported rather than quietly corrected because an
+attribution that survives checking is worth more than one that was never
+checked.
+
+4.4 Amdahl scorecard
+---------------------
+Ceilings are release-equivalent shares: the debug-only bucket is excluded
+before the fraction is taken.
+
+    Optimization  Targeted                  Ceiling   Measured        Verdict
+    ------------  ------------------------  --------  --------------  -----------------
+    opt1          MTF list ops + allocator   18.5%    -11.6% instr    held; reached 69%
+                                                      -12.7% time     of the ceiling
+    opt2          Huffman dict lookup         4.7%    -5.1% instr     right size,
+                                              (1.05x)  vs opt1        wrong mechanism
+
+
+================================================================================
+5. HARDWARE ACCELERATION PROPOSAL -- MOVE-TO-FRONT UNIT (mtf_unit)
+================================================================================
+
+    RTL                  hardware/mtf_unit.v            (Verilog-2005)
+    Testbench            hardware/tb_mtf_unit.v         (self-checking)
+    Stimulus generator   hardware/gen_stimulus.py
+    Build and run        cd hardware && make
+    Full specification   hardware/README.md
+    VERIFICATION         PASS -- 89,837 operations captured from a real bzip2
+                         decode, output stream identical to pyflate
+
+5.1 Why this component
+-----------------------
+    Fixed tiny working set     256 bytes, resident in the unit. No memory
+                               traffic, no cache pressure, no DMA.
+    Trivially regular          one index in, one byte out, one well-defined
+                               table mutation. No floating point, no variable
+                               latency, no exceptions.
+    Executed constantly        89,837 times per benchmark call; in bzip2
+                               generally, once per decoded symbol.
+    Proven in software         opt1 removed 72% of the stage's cost and made
+                               the benchmark 12.7% faster. Hardware removes
+                               the rest.
+    Not narrowly specific      MTF appears in bzip2, some LZ77 variants and
+                               certain cache-replacement policies.
+
+Cost of the operation today: approximately 21,400 instructions to move one
+byte to the front of a 145-entry list. The unit does it in ONE CYCLE.
+
+5.2 Inputs and outputs
+-----------------------
+Parameters: N = 256 entries, DW = 8 bit symbols, IW = 8 bit index.
+All signals synchronous to clk; asynchronous active-low reset rst_n.
+
+    Signal        Dir  Width  Description
+    ------------  ---  -----  ----------------------------------------
+    clk           in     1    clock
+    rst_n         in     1    asynchronous active-low reset
+    load_en       in     1    write one table entry
+    load_addr     in     8    entry address
+    load_data     in     8    entry value
+    load_len      in     9    number of valid entries, 0..256
+    load_commit   in     1    latch load_len, arm the table
+    req_valid     in     1    request a promotion
+    req_index     in     8    index c to promote
+    req_ready     out    1    high when the table is armed
+    rsp_valid     out    1    response strobe
+    rsp_data      out    8    the promoted symbol
+    rsp_error     out    1    req_index >= load_len
+
+    Latency            1 cycle (registered outputs)
+    Throughput         1 operation per cycle, back-to-back, no bubbles
+    Stall conditions   none once armed
+    Target frequency   200 MHz single-cycle
+
+5.3 Block diagram
+------------------
+                 load_addr / load_data / load_en
+                            |
+                            v
+  req_index --+--> +------------------+
+              |    |   TABLE  N x DW  |   256 x 8 flip-flops
+              |    |   entry[0..N-1]  |
+              |    +------------------+
+              |         |        ^
+              |         |        |  conditional parallel shift:
+              |         v        |    entry[0]       <= sel_data
+              |    +---------+   |    entry[i], i<=c <= entry[i-1]
+              +--->| N:1 MUX |---+    entry[i], i>c  <= entry[i]
+                   +---------+
+                        | sel_data
+                        v
+                   +---------+
+                   | RSP REG |--> rsp_data, rsp_valid
+                   +---------+
+
+  req_index --> +---------------+
+                |  <  COMPARE   |--> rsp_error
+  load_len ---> +---------------+
+
+  CONTROL FSM:  S_LOAD --load_commit--> S_READY --load_commit--> S_LOAD
+                (accept writes)         (accept requests)
+
+5.4 Hardware architecture
+--------------------------
+DATAPATH. Three elements. An N:1 read multiplexer selects entry[req_index],
+which is both the response value and the value written back to position 0. A
+conditional shift network of N 8-bit 2:1 multiplexers performs the promotion:
+each entry either holds or takes its neighbour, based on one comparison
+against req_index. A 9-bit magnitude comparator performs the bounds check.
+
+CONTROL. A two-state FSM. S_LOAD accepts table writes and holds req_ready low;
+load_commit latches the length and moves to S_READY. S_READY accepts one
+request per cycle; a further load_commit returns to S_LOAD for the next bzip2
+block. Response strobes default low and assert only on an accepted request, so
+a bounds violation mutates nothing.
+
+5.5 Hardware/software interface
+--------------------------------
+OPTION A -- ISA extension (recommended)
+
+    Instruction          Operands                   Effect
+    -------------------  -------------------------  --------------------------
+    mtf.load  rs1, rs2   rs1 = index, rs2 = value   write one table entry
+    mtf.commit rs1       rs1 = length               arm the table
+    mtf.next  rd, rs1    rs1 = index                rd <- symbol; table updated
+
+In the style of RISC-V custom-0. The unit sits beside the integer ALU and
+writes back through the normal result path. mtf.next is single-cycle with no
+memory operand.
+
+Software changes: a CPython extension module exposing mtf_load(table) and
+mtf_next(c), with move_to_front replaced by a call to the latter. The decoder
+is otherwise unchanged.
+
+OPTION B -- memory-mapped peripheral (AXI4-Lite slave, 32-bit)
+
+    Offset  Access  Register
+    ------  ------  ------------------------------------------------
+    0x00      W     CTRL   bit 0 commit, bit 1 soft_reset
+    0x04      W     LEN    table length, bits 8:0
+    0x08      W     LOAD   bits 15:8 address, bits 7:0 data
+    0x0C      W     REQ    index; the write issues the operation
+    0x10      R     RSP    bit 8 error, bits 7:0 promoted symbol
+    0x14      R     STATUS bit 0 ready
+
+Requires a small kernel driver or /dev/mem mapping plus the same extension
+module. NO DMA: one index in and one byte out per operation is far below the
+threshold where DMA setup would pay.
+
+WHY THE CHOICE MATTERS. Optimization opt2 in the nbody half of this project
+replaced pow with a cheaper formula and made that benchmark 3.7% SLOWER,
+because reaching the cheaper operation cost a Python-level function call. The
+same failure mode applies here:
+
+    Path                              Cost per operation
+    --------------------------------  --------------------------------
+    Today, pure Python                approximately 21,400 instr, 4.1 us
+    Option A, custom instruction      1 cycle, about 5 ns
+    Option B, two bus round trips     approximately 100-200 ns
+
+Both dwarf the 4.1 us being replaced, so either works here. The general rule
+stands: an accelerator whose invocation path costs more than the work it
+replaces is a net loss, and this project measured that outcome once.
+
+5.6 Performance, area and power trade-offs
+-------------------------------------------
+FREQUENCY. The critical path is the N:1 read multiplexer followed by the
+shift-network write -- roughly eight levels of 2:1 multiplexing plus setup. A
+200 MHz single-cycle target is conservative on any modern process. If a higher
+clock is needed, registering sel_data splits the path into two stages: latency
+becomes 2 cycles, throughput stays at 1 operation per cycle, and the decoder
+does not care about latency because it consumes each symbol before issuing the
+next.
+
+AREA.
+    Table storage          256 x 8 = 2,048 flip-flops
+    Shift network          2,048 8-bit-wide 2:1 mux cells
+    Read multiplexer       256:1 x 8 bit
+    Bounds comparator      9-bit
+    Control                1-bit FSM + 9-bit length register
+
+Roughly 2 K flops and 2 K mux cells: small next to a 32 KB L1 cache, and a
+single shared structure rather than something replicated per core.
+
+POWER. Clock-gated outside S_READY, and only the entries below req_index
+switch on each operation, so average switching is proportional to the mean
+promoted index rather than to the full table.
+
+ENERGY -- the defensible claim. Peak power rises while the unit is active. The
+argument is energy per operation: replacing approximately 21,400 executed
+instructions, five heap allocations and about 1,450 refcounted pointer copies
+with one register transfer reduces energy for that operation by orders of
+magnitude, even at higher instantaneous power.
+
+5.7 Expected improvement and its limit
+---------------------------------------
+"The stage" has two defensible definitions and they give different bounds, so
+both are stated. The narrow one is the MTF list operations alone. The wide one
+adds the allocator traffic those slices cause, which the accelerator also
+eliminates, since the allocations stop happening at all.
+
+    Basis                                    Narrow      Wide
+    ---------------------------------------  ----------  ----------
+    Share of profile                          9.57%      15.13%
+    Share excluding debug-build-only code     11.7%      18.5%
+    Time per benchmark call                   368 ms     581 ms
+    AMDAHL CEILING                            1.13x      1.23x
+    Hardware time for all 89,837 operations   449 us     449 us
+    SPEEDUP ON THE STAGE                      820x       1294x
+
+    Measured software analogue (opt1)         -12.7% time, -11.6% instructions
+
+At 200 MHz the hardware performs all 89,837 operations of a decode in 449 us,
+against 368 to 581 ms in software -- a factor of 820 to 1294 on that stage.
+
+Even if the stage becomes effectively free, the whole benchmark improves by
+only about 1.23x on the wide definition. This Amdahl bound is more meaningful
+than quoting the 1294x stage speedup alone.
+
+ASSUMPTIONS
+    1. The table fits in N = 256 entries. bzip2 guarantees this; the unit
+       raises rsp_error rather than misbehaving if it is violated.
+    2. One MTF operation per decoded symbol, which the captured trace confirms.
+    3. The invocation path is cheap relative to 4.1 us -- true for both
+       integration options.
+    4. The profile share comes from a --with-pydebug interpreter. 0.321 G of
+       opt1's measured gain is debug-only work absent from a release build,
+       so the release-build benefit is smaller.
+
+5.8 Verification methodology
+-----------------------------
+    cd hardware && make
+
+gen_stimulus.py instruments move_to_front during an actual decode of
+interpreter.tar.bz2 and records the initial table plus every (index, promoted
+symbol) pair Python produced. pyflate calls move_to_front from two places -- a
+6-entry selector table and the 145-entry symbol table -- and the generator
+selects the busier one.
+
+The testbench loads the captured table, streams all 89,837 requests back to
+back with no bubbles, and compares every response against the value Python
+produced. It also checks that req_ready stays low before the table is armed,
+rises after load_commit, and that an index equal to the table length raises
+rsp_error without mutating the table.
+
+    reset       : req_ready low until the table is armed
+    arm         : req_ready high after load_commit
+    bounds check: index 145 correctly rejected
+    issued     : 89837
+    checked    : 89837
+    mismatches : 0
+    RESULT: PASS -- output stream matches pyflate exactly
+
+Matching the Python output stream symbol for symbol is the meaningful check:
+it demonstrates the unit is a drop-in replacement for the function it removes,
+not merely a plausible piece of logic.
+
+
+================================================================================
+6. CONCLUSION
+================================================================================
+
+pyflate is a data-movement workload. It issues 12x more cache references per
+instruction than nbody and misses 2.8x more often, and its 127,912 page faults
+per fixed-work run come from object churn rather than from the data being
+decompressed.
+
+Two software optimizations were measured against a fixed-work baseline:
+
+    opt1  in-place move-to-front         -12.7%
+    opt2  table-driven Huffman decode    -16.2% cumulative
+
+Both clear the project's 7% threshold. opt1 removed 72% of the move-to-front
+cost by replacing a five-allocation list rebuild with two memmoves. opt2
+removed a further 0.74 G instructions per call, and the attribution showed it
+worked for a different reason than predicted: 92% of its gain came from
+eliminating an interpreted search loop, not from faster dictionary lookups.
+
+Two corrections were forced by checking rather than assuming, and both are
+reported rather than hidden. First, 18.3% of this benchmark's profile is
+debug-allocator code that does not exist in a release interpreter; any
+bottleneck claim that skips that correction is wrong. Second, our initial
+attribution of the list cost to the DEFLATE back-reference copy was mistaken,
+because the DEFLATE path never executes for a bzip2 input file. Reading the
+source in order to write the optimization is what caught it.
+
+The hardware proposal is a move-to-front unit, implemented in Verilog and
+verified against 89,837 operations captured from a real decode, reproducing
+pyflate's symbol stream exactly. It replaces roughly 21,400 executed
+instructions per operation with a single cycle: a 256 x 8-bit table in flops, a
+conditional parallel shift, and a two-state control FSM, at an estimated
+200 MHz with about 2 K flip-flops of storage.
+
+The honest bound matters more than the speedup. Even though the unit makes the
+move-to-front stage 1294x faster and effectively free, Amdahl's law caps the
+whole-benchmark improvement at about 1.23x, because the stage is only 18.5% of
+runtime. An accelerator that eliminates its target completely still delivers
+only what its target was worth.
