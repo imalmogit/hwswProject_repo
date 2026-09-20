@@ -10,10 +10,9 @@
 # be read straight off `total / (N+1)`.
 #
 # opt3 runs in ~3.8 ms per call. Startup -- interpreter init, imports, loading
-# the compiled extension -- is then a LARGER share of the fixed-work run than
-# the benchmark itself, and total/(N+1) over-states the per-call cost by tens of
-# percent. Dividing would not measure the optimization, it would measure Python
-# starting up.
+# the compiled extension -- is then over a third of the fixed-work run, and
+# total/(N+1) over-states the per-call cost by tens of percent. Dividing would
+# measure Python starting up as much as it measures the optimization.
 #
 # THE MODEL
 #

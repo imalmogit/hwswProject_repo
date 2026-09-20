@@ -8,9 +8,7 @@ Hardware acceleration proposal for the bzip2 move-to-front stage in the
 | RTL | `mtf_unit.v` (Verilog-2005) |
 | Testbench | `tb_mtf_unit.v`, self-checking |
 | Stimulus | `gen_stimulus.py` — captured from a real bzip2 decode |
-| Verification status | **PASS** — 89,837 operations, output stream identical to pyflate |
-
----
+| Verification | **PASS** — 89,837 operations, output stream identical to pyflate |
 
 ## 1. What it accelerates
 
@@ -23,72 +21,57 @@ def move_to_front(l, c):
 ```
 
 Three slices, two concatenations and a slice assignment, over a table of up to
-256 entries, executed once per symbol. Measured on the course guest:
+256 entries, once per symbol. Measured on the course guest:
 
 | Measurement | Value |
 | --- | --- |
 | MTF calls per benchmark call | 89,837 |
 | Table size in the test stream | 145 entries |
-| Instructions attributed to the MTF list operations | 1.798 G per benchmark call |
-| **Instructions per MTF operation** | **≈ 20,000** |
-| Share of the profile | 10.74% (18.47% including the allocator underneath) |
-| Time spent in the stage | 337 ms of 3.14 s |
+| **Instructions per MTF operation** | **≈ 21,400** (≈ 4.1 µs) |
+| Share of the profile | 9.57%, or 15.13% with the allocator underneath |
+| Same, excluding debug-build-only code | 11.7%, or 18.5% with the allocator |
 
-Twenty thousand instructions to move one byte to the front of a 145-entry
+The per-operation figure is measured, not estimated: optimization opt1 changes
+`move_to_front` and nothing else, and removes 1.924 G instructions per benchmark
+call across 89,837 operations.
+
+Twenty-one thousand instructions to move one byte to the front of a 145-entry
 list. The accelerator does it in **one cycle**.
 
 ## 2. Why this component
 
-- **Fixed, tiny working set.** 256 bytes, resident in the unit. No memory
+- **Fixed, tiny working set** — 256 bytes, resident in the unit. No memory
   traffic, no cache pressure, no DMA.
-- **Trivially regular.** One index in, one byte out, one well-defined table
+- **Trivially regular** — one index in, one byte out, one well-defined table
   mutation. No floating point, no variable latency, no exceptions.
-- **Executed constantly.** 89,837 times per benchmark call, and in bzip2
-  generally once per decoded symbol.
-- **Already proven in software.** Replacing the rebuild with
-  `l.insert(0, l.pop(c))` removed 68% of the stage's cost and made the whole
+- **Executed constantly** — once per decoded symbol, throughout bzip2.
+- **Already proven in software** — replacing the rebuild with
+  `l.insert(0, l.pop(c))` removed 72% of the stage's cost and made the whole
   benchmark 12.7% faster. The hardware removes the rest.
-- **Not workload-specific in the narrow sense.** MTF is a standard transform
-  in bzip2, LZ77 variants, and some cache-replacement policies.
+- **Not narrowly workload-specific** — MTF is a standard transform in bzip2,
+  LZ77 variants and some cache-replacement policies.
 
 ## 3. Interface
 
-All signals synchronous to `clk`, active-low reset `rst_n`.
-
-### Parameters
-
-| Parameter | Default | Meaning |
-| --- | --- | --- |
-| `N` | 256 | table entries |
-| `DW` | 8 | symbol width in bits |
-| `IW` | 8 | index width; requires `2**IW >= N` |
-
-### Ports
+Synchronous to `clk`, asynchronous active-low `rst_n`. Parameters: `N` = 256
+table entries, `DW` = 8 symbol bits, `IW` = 8 index bits (`2**IW >= N`).
 
 | Signal | Dir | Width | Description |
 | --- | --- | --- | --- |
-| `clk` | in | 1 | clock |
-| `rst_n` | in | 1 | asynchronous active-low reset |
 | `load_en` | in | 1 | write one table entry |
-| `load_addr` | in | `IW` = 8 | entry address |
-| `load_data` | in | `DW` = 8 | entry value |
-| `load_len` | in | `IW+1` = 9 | number of valid entries, 0…256 |
+| `load_addr` | in | 8 | entry address |
+| `load_data` | in | 8 | entry value |
+| `load_len` | in | 9 | number of valid entries, 0…256 |
 | `load_commit` | in | 1 | latch `load_len`, arm the table |
 | `req_valid` | in | 1 | request a promotion |
-| `req_index` | in | `IW` = 8 | index `c` to promote |
+| `req_index` | in | 8 | index `c` to promote |
 | `req_ready` | out | 1 | high when the table is armed |
 | `rsp_valid` | out | 1 | response strobe |
-| `rsp_data` | out | `DW` = 8 | the promoted symbol |
+| `rsp_data` | out | 8 | the promoted symbol |
 | `rsp_error` | out | 1 | `req_index >= load_len` |
 
-### Timing
-
-| Property | Value |
-| --- | --- |
-| Latency | 1 cycle (registered outputs) |
-| Throughput | 1 operation per cycle, back-to-back, no bubbles |
-| Stall conditions | none once armed |
-| Target frequency | **200 MHz** single-cycle (see §6) |
+**Latency** 1 cycle (registered outputs). **Throughput** 1 operation per cycle,
+back to back, no bubbles, no stalls once armed. **Target** 200 MHz single-cycle.
 
 ## 4. Architecture
 
@@ -98,7 +81,6 @@ All signals synchronous to `clk`, active-low reset `rst_n`.
                             ▼
   req_index ──┬──▶ ┌──────────────────┐
               │    │   TABLE  N x DW  │   256 x 8 flip-flops
-              │    │   entry[0..N-1]  │
               │    └──────────────────┘
               │         │        ▲
               │         │        │  conditional parallel shift
@@ -111,164 +93,117 @@ All signals synchronous to `clk`, active-low reset `rst_n`.
                    ┌─────────┐
                    │ RSP REG │──▶ rsp_data, rsp_valid
                    └─────────┘
-                        ▲
   req_index ──▶ ┌───────────────┐
                 │  <  COMPARE   │──▶ rsp_error
   load_len ───▶ └───────────────┘
 
-  CONTROL FSM:   S_LOAD ──load_commit──▶ S_READY ──load_commit──▶ S_LOAD
-                 (accept writes)         (accept requests)
+  FSM:  S_LOAD ──load_commit──▶ S_READY ──load_commit──▶ S_LOAD
 ```
 
-**Datapath.** Three elements. An `N:1` read multiplexer selects
-`entry[req_index]`, which is both the response value and the value written
-back to position 0. A conditional shift network of `N` 8-bit 2:1 multiplexers
-performs the promotion: each entry either holds, or takes its neighbour, based
-on a single comparison against `req_index`. A 9-bit magnitude comparator
-performs the bounds check against the committed length.
+**Datapath — three elements.** An `N:1` read multiplexer selects
+`entry[req_index]`, which is both the response and the value written back to
+position 0. A shift network of `N` 8-bit 2:1 multiplexers performs the
+promotion: each entry either holds or takes its neighbour, decided by one
+comparison against `req_index`. A 9-bit comparator does the bounds check.
 
-**Control.** A two-state FSM. `S_LOAD` accepts table writes and holds
-`req_ready` low; `load_commit` latches the length and moves to `S_READY`.
-`S_READY` accepts one request per cycle; a further `load_commit` returns to
-`S_LOAD` for the next bzip2 block. Response strobes default low and assert only
-on an accepted request, so a bounds violation mutates nothing.
+**Control — two states.** `S_LOAD` accepts table writes and holds `req_ready`
+low; `load_commit` latches the length and moves to `S_READY`, which accepts one
+request per cycle. A further `load_commit` returns to `S_LOAD` for the next
+bzip2 block. Response strobes assert only on an accepted request, so a bounds
+violation mutates nothing.
 
 ## 5. Hardware/software interface
 
-Two integration options. The measured behaviour of optimization opt2 makes the
-choice consequential.
+**Option A — ISA extension (recommended).** Three custom instructions in the
+style of RISC-V `custom-0`: `mtf.load rs1, rs2` writes an entry, `mtf.commit
+rs1` arms the table, and `mtf.next rd, rs1` promotes `rs1` and returns the
+symbol in `rd`. The unit sits beside the integer ALU and writes back through
+the normal result path; `mtf.next` is single-cycle with no memory operand.
+Software side: a CPython extension module exposing `mtf_load(table)` and
+`mtf_next(c)`, with `move_to_front` replaced by a call to the latter.
 
-### Option A — ISA extension (recommended)
+**Option B — memory-mapped peripheral.** A 32-bit AXI4-Lite slave with five
+registers: `CTRL` (commit, soft reset), `LEN`, `LOAD` (address and data),
+`REQ` (the write issues the operation) and `RSP` (error bit plus symbol).
+Needs a small driver plus the same extension module. No DMA — one index in and
+one byte out is far below the threshold where DMA setup would pay.
 
-Two custom instructions in the style of RISC-V `custom-0`:
-
-| Instruction | Operands | Effect |
-| --- | --- | --- |
-| `mtf.load rs1, rs2` | `rs1` = index, `rs2` = value | write one table entry |
-| `mtf.commit rs1` | `rs1` = length | arm the table |
-| `mtf.next rd, rs1` | `rs1` = index | `rd` ← promoted symbol; table updated |
-
-The unit sits beside the integer ALU and writes back through the normal result
-path. `mtf.next` is a single-cycle instruction with no memory operand.
-
-Software changes: a CPython extension module exposing `mtf_load(table)` and
-`mtf_next(c)`, with `move_to_front` replaced by a call to the latter. The
-decoder is otherwise unchanged.
-
-### Option B — memory-mapped peripheral
-
-A 32-bit slave on a peripheral bus (AXI4-Lite or similar):
-
-| Offset | Access | Register |
-| --- | --- | --- |
-| `0x00` | W | `CTRL` — bit 0 `commit`, bit 1 `soft_reset` |
-| `0x04` | W | `LEN` — table length, bits 8:0 |
-| `0x08` | W | `LOAD` — bits 15:8 address, bits 7:0 data |
-| `0x0C` | W | `REQ` — index; the write issues the operation |
-| `0x10` | R | `RSP` — bit 8 `error`, bits 7:0 promoted symbol |
-| `0x14` | R | `STATUS` — bit 0 `ready` |
-
-Requires a small kernel driver or `/dev/mem` mapping plus the same CPython
-extension module. No DMA: one index in and one byte out per operation is far
-below the threshold where DMA setup would pay.
-
-### Why the choice matters
-
-Optimization opt2 in this project replaced `pow` with a cheaper formula and
-made nbody **3.5% slower**, because reaching the cheaper operation cost a
-Python-level function call. The same failure mode applies here. Per MTF
-operation:
+**Why the choice matters.** Optimization opt2 in this project replaced `pow`
+with a cheaper formula and made nbody **3.7% slower**, because reaching the
+cheaper operation cost a Python-level function call. The same failure mode
+applies here:
 
 | Path | Cost per operation |
 | --- | --- |
-| Today, pure Python | ≈ 20,000 instructions ≈ 3.8 µs |
-| Option A, custom instruction | 1 cycle ≈ 5 ns, plus the Python call to the extension |
+| Today, pure Python | ≈ 21,400 instructions ≈ 4.1 µs |
+| Option A, custom instruction | 1 cycle ≈ 5 ns, plus the Python call |
 | Option B, two bus round trips | ≈ 100–200 ns, plus the Python call |
 
-Both dwarf the 3.8 µs being replaced, so either works here. The general lesson
+Both dwarf the 4.1 µs being replaced, so either works here. The general rule
 stands: an accelerator whose invocation path costs more than the work it
-replaces is a net loss, and this project measured exactly that outcome once.
+replaces is a net loss, and this project measured that outcome once.
 
 ## 6. Frequency, area and power
 
 **Frequency.** The critical path is the `N:1` read multiplexer followed by the
-shift-network write, roughly eight levels of 2:1 multiplexing plus setup. A
-**200 MHz** single-cycle target is conservative on any modern process. If a
-higher clock is needed, registering `sel_data` splits the path into two stages:
-latency becomes 2 cycles, throughput stays at 1 operation per cycle, and the
-decoder does not care about latency because it consumes each symbol before
-issuing the next.
+shift-network write — roughly eight levels of 2:1 multiplexing plus setup.
+200 MHz single-cycle is conservative on any modern process. Registering
+`sel_data` would split it into two stages if a higher clock were needed;
+throughput stays at 1 op/cycle and the decoder consumes each symbol before
+issuing the next, so latency does not matter.
 
-**Area.**
+**Area.** 2,048 flip-flops of table storage, 2,048 8-bit 2:1 mux cells for the
+shift network, a 256:1 read mux, a 9-bit comparator and a 1-bit FSM. Small
+beside a 32 KB L1 cache, and a single shared structure rather than something
+replicated per core.
 
-| Element | Size |
-| --- | --- |
-| Table storage | 256 × 8 = 2,048 flip-flops |
-| Shift network | 2,048 8-bit-wide 2:1 mux cells |
-| Read multiplexer | 256:1 × 8 bit |
-| Bounds comparator | 9-bit |
-| Control | 1-bit FSM + 9-bit length register |
-
-Roughly 2 K flops and 2 K mux cells. Small next to a 32 KB L1 cache, and it is
-a single shared structure rather than something replicated per core.
-
-**Power.** The unit is clock-gated outside `S_READY` and switches only the
-entries below `req_index` on each operation, so average switching is
-proportional to the mean promoted index rather than to the full table.
-
-**Energy — the defensible claim.** Peak power rises while the unit is active.
-The argument is energy per operation: replacing ≈ 20,000 executed instructions,
+**Power and energy.** Clock-gated outside `S_READY`, and only the entries below
+`req_index` switch on each operation, so average switching tracks the mean
+promoted index rather than the full table. The defensible claim is energy per
+operation rather than peak power: replacing ≈ 21,400 executed instructions,
 five heap allocations and ≈ 1,450 refcounted pointer copies with one register
-transfer reduces the energy required for that operation by orders of magnitude,
-even at higher instantaneous power.
+transfer cuts the energy for that operation by orders of magnitude.
 
 ## 7. Expected speedup and its limit
 
-| Basis | Value |
-| --- | --- |
-| Share of profile: MTF list operations | 10.74% |
-| Share including the allocator underneath | 18.47% |
-| **Amdahl ceiling, list operations alone** | **1.12×** |
-| **Amdahl ceiling, including the allocator** | **1.23×** |
-| Measured software analogue (opt1) | −12.7% time, −11.6% instructions |
+"The stage" has two defensible definitions. The narrow one is the MTF list
+operations; the wide one adds the allocator traffic those slices cause, which
+the accelerator also eliminates because the allocations stop happening at all.
 
-At 200 MHz the hardware performs all 89,837 operations of a decode in 449 µs,
-against 337 ms in software — a factor of 751 on that stage. **The stage stops
-mattering entirely, and the benchmark still only gets about 1.23× faster.**
-That is Amdahl's law, and stating it plainly is more useful than quoting the
-751×.
+| Basis | Narrow | Wide |
+| --- | --- | --- |
+| Share of profile | 9.57% | 15.13% |
+| Excluding debug-build-only code | 11.7% | 18.5% |
+| Time per benchmark call | 368 ms | 581 ms |
+| **Amdahl ceiling** | **1.13×** | **1.23×** |
+| Stage speedup | 820× | 1294× |
 
-### Assumptions
+At 200 MHz the unit performs all 89,837 operations of a decode in 449 µs,
+against 368–581 ms in software. **The stage stops mattering entirely, and the
+benchmark still only gets about 1.23× faster.** That is Amdahl's law, and
+stating it plainly is more useful than quoting the 1294×. For comparison, the
+software fix (opt1) already delivered −12.7% time and −11.6% instructions.
 
-1. The table fits in `N = 256` entries. bzip2 guarantees this; the unit raises
-   `rsp_error` rather than misbehaving if it is violated.
-2. One operation per decoded symbol, which the captured trace confirms.
-3. The invocation path is cheap relative to 3.8 µs — true for both integration
-   options above.
-4. The profile share is taken from a `--with-pydebug` interpreter. 0.372 G of
-   the measured allocator saving is debug-only work that would not exist in a
-   release build, so the release-build benefit is smaller. This is stated in
-   the report's threats-to-validity section.
+**Assumptions.** The table fits in `N` = 256 entries, which bzip2 guarantees and
+`rsp_error` catches otherwise; one operation per decoded symbol, which the
+captured trace confirms; and an invocation path cheap relative to 4.1 µs, true
+for both options above. Note also that the profile comes from a `--with-pydebug`
+interpreter — 0.321 G of opt1's measured gain is debug-only work absent from a
+release build, so the release benefit is smaller.
 
 ## 8. Verification
 
 ```bash
-python3 gen_stimulus.py          # capture vectors from a real bzip2 decode
-iverilog -Wall -g2005 -o tb tb_mtf_unit.v mtf_unit.v
-vvp tb
+make                             # generate stimulus, compile, simulate
 ```
 
 `gen_stimulus.py` instruments `move_to_front` during an actual decode of
 `interpreter.tar.bz2` and records the initial table plus every
-(index, promoted symbol) pair. pyflate calls `move_to_front` from two places —
-a 6-entry selector table and the 145-entry symbol table — and the generator
-selects the busier one.
-
-The testbench loads the captured table, streams all 89,837 requests back to
-back with no bubbles, and compares every response against the value Python
-produced. It additionally checks that `req_ready` stays low before the table is
-armed, that it rises after `load_commit`, and that an index equal to the table
-length raises `rsp_error` without mutating the table.
+(index, promoted symbol) pair. pyflate calls it from two places — a 6-entry
+selector table and the 145-entry symbol table — and the generator picks the
+busier one. The testbench loads the captured table, streams all 89,837 requests
+back to back with no bubbles, and compares every response against the value
+Python produced, plus reset, arming and bounds-check coverage.
 
 ```
   reset       : req_ready low until the table is armed
@@ -281,5 +216,5 @@ length raises `rsp_error` without mutating the table.
 ```
 
 Matching the Python output stream symbol for symbol is the meaningful check: it
-demonstrates the unit is a drop-in replacement for the function it removes, not
-merely a plausible piece of logic.
+shows the unit is a drop-in replacement for the function it removes, not merely
+a plausible piece of logic.

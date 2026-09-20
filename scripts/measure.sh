@@ -14,12 +14,30 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 DIR=$1
 N=$2
+
+# A bare name works as well as a path: "bm_nbody" resolves under $BM and
+# "bm_nbody_opt1" under benchmarks/. $BM is set by env.sh INSIDE this script,
+# so writing "$BM/bm_nbody" on the command line expands to "/bm_nbody" unless
+# the caller happens to have exported it -- which is a trap, not a feature.
+if [ ! -f "$DIR/run_benchmark.py" ]; then
+  for c in "$BM/$DIR" "$ROOT/benchmarks/$DIR" "$ROOT/$DIR"; do
+    if [ -f "$c/run_benchmark.py" ]; then DIR=$c; break; fi
+  done
+fi
+
 NAME=$(basename "$DIR")
 OUT="$ROOT/results/$NAME"
-mkdir -p "$OUT"
 
 BENCH="$DIR/run_benchmark.py"
-[ -f "$BENCH" ] || { echo "no run_benchmark.py in $DIR"; exit 1; }
+if [ ! -f "$BENCH" ]; then
+  echo "no run_benchmark.py for '$1'"
+  echo "  tried: $1"
+  echo "         $BM/$1"
+  echo "         $ROOT/benchmarks/$1"
+  echo "  available: $(ls "$ROOT/benchmarks" 2>/dev/null | tr '\n' ' ')"
+  exit 1
+fi
+mkdir -p "$OUT"
 
 echo "=============================================="
 echo "[*] $NAME   (-l 1 -w 1 -n $N)"
